@@ -1,0 +1,18 @@
+{
+  "layout": "describe the rig here (free text, shown nowhere critical)",
+  "can_by_serial": {
+    "SERIAL_OF_THE_ADAPTER_ON_THE_RIGHT_ARM": "can0",
+    "SERIAL_OF_THE_ADAPTER_ON_THE_LEFT_ARM": "can1"
+  },
+  "cameras": {
+    "high": "pci-0000:00:14.0-usb-0:2",
+    "left_wrist": "pci-0000:00:14.0-usb-0:1",
+    "right_wrist": "pci-0000:00:14.0-usb-0:3"
+  },
+  "capture_fps": 120,
+  "swap_gripper_raw_cal": false,
+  "grip_cal": {
+    "left": [0.011, -5.094, 6.351, 1.45],
+    "right": [0.060, -5.041, 6.392, 1.34]
+  }
+}

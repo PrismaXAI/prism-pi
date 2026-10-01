@@ -1,0 +1,20 @@
+{
+  "fruits": {
+    "label": "Fruits (my checkpoint, step 4000)",
+    "path": "ckpt/fruits_004000",
+    "tasks": ["Pick and place various fruits into containers"],
+    "flags": "pnp"
+  },
+  "fold": {
+    "label": "Fold clothes",
+    "path": "ckpt/fold_003000",
+    "tasks": ["Fold clothes"],
+    "flags": "bimanual"
+  },
+  "custom_flags": {
+    "label": "Explicit executor flags instead of a preset",
+    "path": "/abs/path/to/pretrained_model",
+    "tasks": ["Pick and place donuts"],
+    "flags": ["--rtc", "--server", "on", "--abort-wr1", "0.6"]
+  }
+}

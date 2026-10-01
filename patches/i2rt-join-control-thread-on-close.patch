@@ -1,0 +1,24 @@
+diff --git a/i2rt/motor_drivers/dm_driver.py b/i2rt/motor_drivers/dm_driver.py
+index d917467..ac7cd21 100644
+--- a/i2rt/motor_drivers/dm_driver.py
++++ b/i2rt/motor_drivers/dm_driver.py
+@@ -563,6 +563,7 @@ class DMChainCanInterface(MotorChain):
+         logging.info("starting separate thread for control loop")
+         thread = threading.Thread(target=self._set_torques_and_update_state)
+         thread.start()
++        self._control_thread = thread
+         self.start_thread_flag = True
+         time.sleep(0.1)
+         while self.state is None:
+@@ -777,6 +778,11 @@ class DMChainCanInterface(MotorChain):
+ 
+     def close(self) -> None:
+         self.running = False
++        # let the control loop finish its current cycle before the socket goes away (otherwise it logs a
++        # "Bad file descriptor" / "file descriptor cannot be a negative integer" traceback at every shutdown)
++        t = getattr(self, "_control_thread", None)
++        if t is not None and t is not threading.current_thread():
++            t.join(timeout=0.5)
+         self.motor_interface.close()
+ 
+ 

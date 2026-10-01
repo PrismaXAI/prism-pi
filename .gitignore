@@ -1,0 +1,20 @@
+# environments and the SDK checkout
+.venv/
+i2rt/
+__pycache__/
+*.pyc
+# per-rig / per-user configuration (examples are tracked)
+rig_mapping.json
+checkpoints.json
+sag_table.json
+# checkpoints and engines
+ckpt/
+trt_cache/
+# run-time state and outputs
+ESTOP
+executor_status.json
+executor_control.json
+runs/
+datasets/
+dryrun_out/
+*.log

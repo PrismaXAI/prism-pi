@@ -1,0 +1,33 @@
+# Rollout stack: pi0.5 inference (LeRobot), policy server (+ TensorRT engines), executor, web UI, dataset recording.
+# The checkpoints were validated with exactly the versions in constraints.txt (Python 3.12, torch 2.10.0 / CUDA 12.8
+# wheels, lerobot 0.5.1, transformers 5.3.0):
+#   uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements.txt -c constraints.txt
+# The i2rt SDK is installed separately WITHOUT its dependencies (see AGENTS.md); its runtime needs are listed below.
+torch==2.10.0
+torchvision==0.25.0
+lerobot[pi]==0.5.1
+transformers==5.3.0
+numpy
+scipy
+opencv-python-headless
+pillow
+av
+# web UI
+fastapi
+uvicorn
+pydantic
+# policy-server acceleration (optional at runtime: the server falls back to eager PyTorch without them)
+tensorrt-cu12
+onnx
+onnxscript
+# i2rt SDK runtime dependencies for the parts used here (the SDK itself: uv pip install --no-deps -e i2rt;
+# its full dependency list does not resolve on Python 3.12)
+python-can
+tyro
+crcmod
+mujoco
+pyyaml
+dm-env
+mcap
+mcap-ros2-support
+packaging
