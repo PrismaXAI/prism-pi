@@ -1,11 +1,11 @@
-"""Run yam_executor.main() with NO CAN access: DryArm is replaced by a stub that tracks commands with a
+"""Run the executor's main() with NO CAN access: DryArm is replaced by a stub that tracks commands with a
 first-order lag (~100 ms, like the sim lag dynamics). Real GPU inference, real WebUI frames. Use it to
 check loop timing / chunk alignment / a new checkpoint loading before touching the arms:
-  HF_HUB_OFFLINE=1 .venv/bin/python yam_executor_offline_test.py --ckpt <checkpoint dir> --task "..." --dry --duration 12 --out /tmp/x
+  HF_HUB_OFFLINE=1 .venv/bin/python -m prism_pi.control.offline_test --ckpt <checkpoint dir> --task "..." --dry --duration 12 --out /tmp/x
 """
 import time, numpy as np
-import yam_executor as ye
-from dryrun_inference import GRIP_CAL
+from prism_pi.control import executor as ye
+from prism_pi.rig.hardware import GRIP_CAL
 
 class StubArm:
     def __init__(self, channel, side):
@@ -29,5 +29,7 @@ class StubArm:
             print(f"[{self.side}] {len(self.sent)} cmds; tick period ms: mean {dt.mean():.1f} p50 {np.median(dt):.1f} "
                   f"p99 {np.percentile(dt, 99):.1f} max {dt.max():.1f}; ticks > 40 ms: {(dt > 40).sum()}")
 
-ye.DryArm = StubArm
-ye.main()
+
+if __name__ == "__main__":
+    ye.DryArm = StubArm
+    ye.main()

@@ -12,14 +12,14 @@ Default scheme (= run_policy_sim.py of the yamulator simulator):
   - --simple keeps the legacy synchronous scheme (predict with the arm holding, execute steps 0..N-1,
     repeat) for A/B runs against the dwell.
   - Safety: homing to the dataset rest pose + grippers opened before the first observation, start-jump
-    gate, envelope clamp, rate limits, e-stop flag (yam_webui.py) checked every tick, motor-chain
+    gate, envelope clamp, rate limits, e-stop flag (set by the web UI) checked every tick, motor-chain
     liveness, post-miss excursion abort (--abort-wr1), heartbeat JSON for the WebUI. Frames come from the
     WebUI's /frame endpoints (single owner of /dev/video*).
   - Sag compensation (sag_comp.py) is applied only to leader-action checkpoints; follower-action
     checkpoints (FOLLOWER_ACTIONS marker or "follower" in train_config.json) run without it.
 
 Usage (arms will MOVE unless --dry):
-  HF_HUB_OFFLINE=1 .venv/bin/python yam_executor.py --ckpt <checkpoint dir> --task "<task string of the checkpoint>" --dry
+  HF_HUB_OFFLINE=1 .venv/bin/python -m prism_pi.control.executor --ckpt <checkpoint dir> --task "<task string of the checkpoint>" --dry
 """
 
 import argparse
@@ -36,16 +36,16 @@ _signal.signal(_signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterru
 import numpy as np
 import torch
 
-# importing dryrun_inference registers the relative_actions_processor shim
-from dryrun_inference import (  # noqa: F401
+from prism_pi.paths import ESTOP_FLAG, HEARTBEAT, ROOT  # ESTOP_FLAG: latched by the web UI's e-stop; checked before and during every run
+from prism_pi.policy import relative_actions_compat  # noqa: F401  registers the relative-action step name of our training fork
+from prism_pi.rig.hardware import (  # noqa: F401
     CAM_PORTS,
-    UI_BASE,
     GRIP_CAL,
     LEFT_CAN,
     RIGHT_CAN,
+    UI_BASE,
     HttpCam,
     PassiveYamReader,
-    RelativeActionsProcessorStep,
     grip_to_train,
     load_train_stats,
 )
@@ -61,7 +61,7 @@ TRAIN_COLOR = {
 
 
 class SyncedFrames:
-    """One /frames?fresh=1 request for all three cameras (yam_webui.py): the reply holds frames captured AFTER the
+    """One /frames?fresh=1 request for all three cameras (web UI): the reply holds frames captured AFTER the
     request, so the observation is taken on fresh, mutually aligned images (<= 1 frame period old at 120 fps) and the
     joint state is read right after. Per-camera SyncedCam objects hand out the frames so the usual view wrappers apply."""
 
@@ -179,9 +179,6 @@ class ColorMatchedCam:
 
     def close(self):
         self.inner.close()
-ROOT = Path(__file__).resolve().parent
-ESTOP_FLAG = ROOT / "ESTOP"                      # latched by the web UI's e-stop; checked before and during every run
-HEARTBEAT = ROOT / "executor_status.json"
 MAX_ARM_STEP = 0.07   # rad per control tick, per joint. 2026-09-19: lowered from the sim's 0.10 after the table crash — the demonstrations
                       # never exceed 0.082 rad/tick (p99.9 <= 0.072) and good rig runs sit at p99 ~0.03, so 0.07 only bites on abnormal jumps
 MAX_GRIP_STEP = 0.10  # normalized per tick
@@ -329,7 +326,7 @@ def main():
                          "frame at the tick is used (up to one frame period stale, cameras mutually unaligned)")
     ap.add_argument("--sync-timeout-ms", type=int, default=20)
     ap.add_argument("--control-file", default=None,
-                    help="JSON file polled during the run (written by yam_webui.py): {\"cmd\": \"run\"|\"pause\"|\"end\", \"task\": str}. "
+                    help="JSON file polled during the run (written by the web UI): {\"cmd\": \"run\"|\"pause\"|\"end\", \"task\": str}. "
                          "pause = hold both arms in place under power, no inference (time paused does not count toward --duration); "
                          "run = resume from a fresh observation (optionally with a new task); end = park and release. "
                          "Sim-matched scheme with the policy server only.")
@@ -346,7 +343,7 @@ def main():
                     help="abort if first action deviates more than this (rad) from current pose")
     ap.add_argument("--out", default=str(ROOT / "runs"))
     ap.add_argument("--run-name", default=None, help="name of the run directory under --out (default: a timestamp); the WebUI "
-                    "passes its own stamp so it can find run.npz for the LeRobot dataset conversion (rollout_to_lerobot.py)")
+                    "passes its own stamp so it can find run.npz for the LeRobot dataset conversion (prism_pi/rollout_to_lerobot.py)")
     ap.add_argument("--max-arm-step", type=float, default=MAX_ARM_STEP,
                     help="per-tick arm joint rate limit (rad); default 0.07 (sim runner default is still 0.10: pass --max-arm-step 0.10 for strict sim parity)")
     ap.add_argument("--color-match", action="store_true",
@@ -357,7 +354,7 @@ def main():
     ap.add_argument("--degrade", action="store_true",
                     help="soften frames to match training video quality (blur + jpeg round-trip)")
     ap.add_argument("--sag-comp", choices=["auto", "on", "off"], default="auto",
-                    help="dataset follower-sag offset on arm targets (sag_comp.py, needs sag_table.json). auto = ON for "
+                    help="dataset follower-sag offset on arm targets (sag_comp.py, needs config/sag_table.json). auto = ON for "
                          "leader-action checkpoints when a sag table is installed, OFF if the checkpoint dir contains a "
                          "FOLLOWER_ACTIONS marker file or its train_config.json mentions follower actions (never double-compensate)")
     ap.add_argument("--abort-wr1", type=float, default=0.35,
@@ -386,7 +383,7 @@ def main():
                     help="cap on the commanded DOWNWARD fingertip speed, cm/s: HIGH applies above 15 cm, tapering to NEAR_TABLE at/below 5 cm above the arm base plane "
                          "(demonstrations: max 35, p99.9 22-31 near the table; the 2026-09-19 crash plunged at ~55). 0 0 disables. Sim-matched scheme")
     ap.add_argument("--preclose-advance-mm", type=float, nargs=3, default=[0.0, 0.0, 0.0], metavar=("X", "Y", "Z"),
-                    help="one-shot tool-frame advance at close onset (yamsim/tool_offset.py, as in the simulator's run_policy_sim.py): when the policy starts to close a "
+                    help="one-shot tool-frame advance at close onset (tool_offset.py, as in the simulator's run_policy_sim.py): when the policy starts to close a "
                          "gripper it is held for --preclose-ticks while the tool advances by this vector (mm, gripper frame: x across the pads, + = away from the "
                          "wrist camera = forward along the reach; z along the fingers, - = toward the tips), then the close proceeds. Sim-matched scheme only")
     ap.add_argument("--preclose-ticks", type=int, default=6, help="ticks (30 Hz) over which the pre-close advance is made and the gripper is held")
@@ -400,7 +397,7 @@ def main():
     ap.add_argument("--arb-zone", type=float, default=0.20, help="work-zone half width, m (pad lateral distance from the rig centre)")
     ap.add_argument("--arb-timeout", type=float, default=8.0, help="s an owner may sit in the zone without closing before yielding")
     ap.add_argument("--server", choices=["auto", "on", "off"], default="auto",
-                    help="use the persistent policy server (policy_server.py) so the model stays in VRAM between runs. "
+                    help="use the persistent policy server (prism_pi.policy.server) so the model stays in VRAM between runs. "
                          "auto = use it if it is up, else load the model locally; on = require it; off = always load locally")
     ap.add_argument("--plan-samples", type=int, default=1,
                     help="K flow-matching samples per observation in one batched forward pass (needs the server). "
@@ -433,7 +430,7 @@ def main():
         follower_ckpt |= "follower" in (ck / "train_config.json").read_text().lower()
     except Exception:
         pass
-    import sag_comp
+    from prism_pi.control import sag_comp
     if args.sag_comp == "auto":
         args.no_sag_comp = follower_ckpt or not sag_comp.available()
     else:
@@ -441,9 +438,9 @@ def main():
         if args.sag_comp == "on" and follower_ckpt:
             raise SystemExit("REFUSING: --sag-comp on with a follower-action checkpoint would double-compensate.")
         if args.sag_comp == "on" and not sag_comp.available():
-            raise SystemExit(f"--sag-comp on needs {sag_comp.TABLE} (see sag_table.example.json)")
+            raise SystemExit(f"--sag-comp on needs {sag_comp.TABLE} (see config/sag_table.example.json)")
     print("== sag compensation: " + ("ON (leader-action checkpoint)" if not args.no_sag_comp else
-                                     "OFF (follower-action checkpoint)" if follower_ckpt else "OFF (no sag_table.json)") + " ==")
+                                     "OFF (follower-action checkpoint)" if follower_ckpt else "OFF (no config/sag_table.json)") + " ==")
 
     run_dir = Path(args.out) / (args.run_name or time.strftime("%Y%m%d_%H%M%S"))
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -460,11 +457,11 @@ def main():
                          "tokenizer. Install the real google/paligemma-3b-pt-224 tokenizer snapshot (see AGENTS.md).")
     use_server = False
     if args.server != "off":
-        from policy_client import RemoteRunner, server_info
+        from prism_pi.policy.client import RemoteRunner, server_info
         if server_info() is not None:
             use_server = True
         elif args.server == "on":
-            raise SystemExit("ABORT: --server on but no policy server is reachable (start policy_server.py)")
+            raise SystemExit("ABORT: --server on but no policy server is reachable (start python -m prism_pi.policy.server)")
     if args.plan_samples > 1 and not use_server:
         raise SystemExit("ABORT: --plan-samples > 1 needs the policy server")
     if args.rtc and use_server:
@@ -663,7 +660,7 @@ def main():
             tick = 0
             n_chunks = 0
             # ramp into chunk[0] of the first (already computed) chunk
-            from sag_comp import compensate14
+            from prism_pi.control.sag_comp import compensate14
             sag = (lambda a, q: compensate14(a, q)) if not args.no_sag_comp else (lambda a, q: a)
             q_sag = get_state()
             for i in range(RAMP_TICKS):
@@ -739,13 +736,13 @@ def main():
         # holding the arm while it runs (the --simple dwell, which the sim ablation showed costs picks) the arm keeps
         # following the previous chunk and the new one is entered at step (tick - obs_tick): every executed step keeps
         # the wall-clock alignment it had in the sim, only the first ~9 steps of each chunk are never executed.
-        from sag_comp import compensate14
+        from prism_pi.control.sag_comp import compensate14
         sag = (lambda a, q: compensate14(a, q)) if not args.no_sag_comp else (lambda a, q: a)
         rate = np.array([args.max_arm_step] * 6 + [MAX_GRIP_STEP] +
                         [args.max_arm_step] * 6 + [MAX_GRIP_STEP])
         arb = None
         if args.arbitrate:
-            from arm_arbiter import ZoneArbiter
+            from prism_pi.control.arm_arbiter import ZoneArbiter
             arb = ZoneArbiter(zone_w=args.arb_zone, timeout_s=args.arb_timeout, hold_mode=args.arb_hold)
             print(f"== arm arbitration ON: one arm at a time within {args.arb_zone*100:.0f} cm of the centre line, "
                   f"dither timeout {args.arb_timeout:.0f} s ==")
@@ -754,12 +751,12 @@ def main():
         arb_rejoin = {"left": False, "right": False}   # arm was held by the arbiter and has not yet caught up with the policy's plan
         down_cap = None
         if args.max_down_speed_cm_s[0] > 0:
-            from yamsim.tool_offset import DownSpeedCap, ToolShifter as _TS
+            from prism_pi.control.tool_offset import DownSpeedCap, ToolShifter as _TS
             down_cap = DownSpeedCap(shifter if shifter is not None else _TS(), args.max_down_speed_cm_s[0], max(args.max_down_speed_cm_s[1], 1.0), max_step=args.max_arm_step)
             print(f"== downward fingertip speed cap: {args.max_down_speed_cm_s[0]:.0f} cm/s above 15 cm -> {args.max_down_speed_cm_s[1]:.0f} cm/s at <= 5 cm ==")
         _pv = np.array(args.preclose_advance_mm, float) / 1000.0
         if np.linalg.norm(_pv) > 0:
-            from yamsim.tool_offset import PreCloseAdvance, ToolShifter, floor_limited
+            from prism_pi.control.tool_offset import PreCloseAdvance, ToolShifter, floor_limited
             shifter = ToolShifter(); pre_dir = _pv / np.linalg.norm(_pv)
             import os as _os   # YAM_PRECLOSE_THR: test-only override of the close-onset threshold (offline harness)
             pre = PreCloseAdvance(float(np.linalg.norm(_pv)), args.preclose_ticks, relative=is_relative, close_thr=float(_os.environ.get("YAM_PRECLOSE_THR", 0.20)))
@@ -945,7 +942,7 @@ def main():
                 target = (1 - alpha) * last_cmd + alpha * target
             cmd = last_cmd + np.clip(target - last_cmd, -rate_t, rate_t)
             sent = cmd - OFF14  # physical = policy frame - delta
-            if pre is not None:   # one-shot tool-frame advance at close onset (see yamsim/tool_offset.py)
+            if pre is not None:   # one-shot tool-frame advance at close onset (see tool_offset.py)
                 held, adv = pre.step(tick, cmd, {"left": obs_tick, "right": obs_tick})
                 for side, o in (("left", 0), ("right", 7)):
                     dq = np.zeros(6)

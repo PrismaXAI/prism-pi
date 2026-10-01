@@ -1,7 +1,7 @@
 """Hardware calibration probe: drive one arm so the finger tips sit a set height above the work surface with the
 gripper pointing straight down, hold for a ruler measurement, then return to rest and release torque.
 
-IK/FK use the sim's URDF model (yamsim/kinematics.py) in the ARM'S OWN base frame (x = reach direction,
+IK/FK use the URDF model (prism_pi/control/kinematics.py) in the ARM'S OWN base frame (x = reach direction,
 z = up, origin = base mounting plate top / work surface when the plates are flush). During the hold it prints the
 model's tip position from the MEASURED joints, so a ruler reading that disagrees = zeroing / kinematic error.
 
@@ -14,12 +14,13 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from yamsim.kinematics import YamArm, GripperCalibration, solve_ik, top_down_grasp_frame, FINGER_TIP_OFFSET  # noqa: E402
+from prism_pi import paths  # noqa: E402
+from prism_pi.control.kinematics import YamArm, GripperCalibration, solve_ik, top_down_grasp_frame, FINGER_TIP_OFFSET  # noqa: E402
 
-YAM_URDF = str(ROOT / "assets/yam/yam.urdf")
+YAM_URDF = str(paths.URDF)
 CTRL_HZ = 30.0
 REST = np.array([0, 0, 0, -0.08, 0, 0], float)
-ESTOP = ROOT / "ESTOP"
+ESTOP = paths.ESTOP_FLAG
 CAN = {"left": "can1", "right": "can0"}
 
 
@@ -84,7 +85,7 @@ def main():
 
     if ESTOP.exists():
         raise SystemExit("E-STOP flag latched — clear it in the WebUI first.")
-    from yam_executor import RealArm
+    from prism_pi.control.executor import RealArm
     print(f"== connecting {args.arm} arm ({CAN[args.arm]}) ==")
     robot = RealArm(CAN[args.arm], args.arm)
 

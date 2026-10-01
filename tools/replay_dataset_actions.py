@@ -22,8 +22,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from dryrun_inference import GRIP_CAL, LEFT_CAN, RIGHT_CAN, load_train_stats, STATE_NAMES
-from yam_executor import RealArm, DryArm, ESTOP_FLAG, HEARTBEAT, CTRL_HZ, MAX_GRIP_STEP
+from prism_pi.rig.hardware import GRIP_CAL, LEFT_CAN, RIGHT_CAN, load_train_stats, STATE_NAMES
+from prism_pi.control.executor import RealArm, DryArm, ESTOP_FLAG, HEARTBEAT, CTRL_HZ, MAX_GRIP_STEP
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -40,7 +40,7 @@ def main():
     ap.add_argument("--seconds", type=float, default=10.0)
     ap.add_argument("--speed", type=float, default=1.0, help="playback speed (0.5 = half speed)")
     ap.add_argument("--sag-comp", action="store_true",
-                    help="add the dataset follower-sag offset (sag_table.json) to each commanded arm target")
+                    help="add the dataset follower-sag offset (config/sag_table.json) to each commanded arm target")
     ap.add_argument("--hold-at-start", type=float, default=0.0,
                     help="pause this many seconds at the dataset start pose (action[0]) before replaying")
     ap.add_argument("--hold-at-grasp", type=float, default=0.0,
@@ -68,7 +68,7 @@ def main():
     Arm = DryArm if args.dry else RealArm
     left, right = Arm(LEFT_CAN, "left"), Arm(RIGHT_CAN, "right")
     log = {"cmds": [], "states": []}
-    from dryrun_inference import HttpCam, CAM_PORTS
+    from prism_pi.rig.hardware import HttpCam, CAM_PORTS
     import cv2
     cams = {n: HttpCam(n) for n in CAM_PORTS}
     out = ROOT / "runs" / f"replay_{args.episode}_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -97,7 +97,7 @@ def main():
             cmd[gi] = np.clip((cmd[gi] - to) / (tc - to), 0, 1)
         park = cmd.copy()
 
-        from sag_comp import compensate14
+        from prism_pi.control.sag_comp import compensate14
         last_state = [q0.copy()]
 
         def step_towards(target, r):

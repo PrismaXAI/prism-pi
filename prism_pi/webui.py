@@ -3,8 +3,8 @@
 Serves on 0.0.0.0:8080 — open http://<machine-ip>:8080 from any device on the LAN/Wi-Fi (mouse or touch / iPad).
 
 - Live MJPEG streams of all three cameras (policy-view framing: full sensor -> 640x400).
-- Rollout sessions: pick a checkpoint (listed in checkpoints.json) and one of its tasks, then either a single TIMED run
-  or a CONTINUOUS session. The UI spawns yam_executor.py (sim-matched scheme, RTC + arbitration, policy server) and
+- Rollout sessions: pick a checkpoint (listed in config/checkpoints.json) and one of its tasks, then either a single TIMED run
+  or a CONTINUOUS session. The UI spawns the executor (prism_pi.control.executor; sim-matched scheme, RTC + arbitration, policy server) and
   steers it through a control file: PAUSE = both arms held in place under power with the policy stopped (reset the
   scene, optionally change the task), RESUME = fresh observation and carry on, END SESSION = park both arms under
   power, then release. The policy server keeps the model in VRAM; it is only asked to load when the selected
@@ -14,13 +14,13 @@ Serves on 0.0.0.0:8080 — open http://<machine-ip>:8080 from any device on the 
   re-enable anything by itself).
 - /frame/{cam}.jpg gives the latest frame to other local consumers (the executor shares the cameras through it).
 - LeRobot dataset option: the session's frames are recorded at the full capture rate and, when the session ends, paired
-  with the executor's per-tick log (state, commanded action, wall clock) by rollout_to_lerobot.py into
+  with the executor's per-tick log (state, commanded action, wall clock) by prism_pi.rollout_to_lerobot into
   datasets/<name>/ (LeRobot v3, the training dataset's exact schema; one episode per run segment, i.e. PAUSE/RESUME =
   scene reset = new episode). Conversions run one at a time in the background; progress shows in the UI.
 - POST /session/start with "dry": true runs the executor's offline harness (stub arms, no CAN, real cameras + policy
   server) instead of the robot: pipeline tests without touching the arms (same as YAM_UI_TEST=1 for every session).
 
-Run: setsid nohup .venv/bin/python yam_webui.py > webui.log 2>&1 &   (or ./rig_up.sh)
+Run: setsid nohup .venv/bin/python -m prism_pi.webui > webui.log 2>&1 &   (or ./rig_up.sh)
 """
 
 import ctypes
@@ -50,23 +50,22 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-import policy_client
+from prism_pi.paths import CHECKPOINTS, CONTROL, DATASETS, ESTOP_FLAG, HEARTBEAT, ROOT, RUNS
+from prism_pi.policy import client as policy_client
+from prism_pi.rig import mapping as rig_mapping
 
-ROOT = Path(__file__).resolve().parent
-ESTOP_FLAG = ROOT / "ESTOP"
-HEARTBEAT = ROOT / "executor_status.json"
-CONTROL = ROOT / "executor_control.json"
 PY = sys.executable      # the executor / policy server / dataset converter run in this UI's own environment
-import rig_mapping
-# camera name -> /dev/v4l/by-path device, from rig_mapping.json (all three cameras share one USB serial: address by port)
+# camera name -> /dev/v4l/by-path device, from config/rig_mapping.json (all three cameras share one USB serial: address by port)
 CAMS = {n: rig_mapping.camera_device(n) for n in ("high", "left_wrist", "right_wrist")}
 STREAM_FPS = 15          # browser streams (the capture pipeline itself runs at CAP_FPS)
-# camera capture rate: higher = fresher frames (sampling delay 1/fps), more decode CPU. Default from rig_mapping.json
+# camera capture rate: higher = fresher frames (sampling delay 1/fps), more decode CPU. Default from config/rig_mapping.json
 # ("capture_fps", default 120); two cameras behind ONE hub do not get USB bandwidth for 120 fps each: use 60 there.
 CAP_FPS = int(os.environ.get("YAM_CAP_FPS", rig_mapping.load().get("capture_fps", 120)))
 # processes the e-stop kills (never this UI itself, never the policy server)
-KILL_PATTERNS = ("dryrun_inference|yam_executor|minimum_gello|bimanual_lead_follower|motor_chain_robot.py|record_replay"
-                 "|probe_tip_height|probe_cam_latency|replay_dataset_actions|identify_arms|calibrate_gripper")
+# (matched against full command lines by `pkill -f`: this repo's arm-driving modules and tools, plus the i2rt SDK's teleop scripts)
+KILL_PATTERNS = ("prism_pi.control.executor|prism_pi.control.offline_test|prism_pi.rig.dryrun"
+                 "|probe_tip_height|probe_cam_latency|replay_dataset_actions|identify_arms|calibrate_gripper"
+                 "|minimum_gello|bimanual_lead_follower|motor_chain_robot.py|record_replay")
 
 # the standard pick-and-place rig command (2026-09-19): sim-matched scheme + RTC via the server + arm arbitration (one arm
 # at a time near the centre line) + post-miss excursion guard 0.6 rad. Folding is bimanual and pitches the wrists up
@@ -77,12 +76,12 @@ PNP_FLAGS = FLAG_PRESETS["pnp"]
 
 
 def load_ckpts() -> dict:
-    """checkpoints.json (next to this file; see checkpoints.example.json): key -> {"label", "path" (checkpoint or shim
-    dir, absolute or relative to this directory), "tasks" (verbatim training strings), "flags" (a preset name from
-    FLAG_PRESETS or an explicit list of yam_executor.py arguments; default "pnp")}."""
-    f = ROOT / "checkpoints.json"
+    """config/checkpoints.json (see checkpoints.example.json there): key -> {"label", "path" (checkpoint or shim dir,
+    absolute or relative to the repository root), "tasks" (verbatim training strings), "flags" (a preset name from
+    FLAG_PRESETS or an explicit list of executor arguments; default "pnp")}."""
+    f = CHECKPOINTS
     if not f.exists():
-        print(f"[webui] no {f.name}: no checkpoints to roll out (copy checkpoints.example.json)", flush=True)
+        print(f"[webui] no config/{f.name}: no checkpoints to roll out (copy config/checkpoints.example.json)", flush=True)
         return {}
     out = {}
     for key, c in json.loads(f.read_text()).items():
@@ -98,7 +97,7 @@ GRIP_ASSIST = 0.05   # extra closure (normalized 0..1) added once the policy is 
 # test hook (no CAN access): YAM_UI_TEST=1 runs the executor's offline harness (stub arms, --dry) instead of the real thing
 TEST_DRY = os.environ.get("YAM_UI_TEST") == "1"
 PORT = int(os.environ.get("YAM_UI_PORT", 8080))
-DATASETS = ROOT / "datasets"            # LeRobot datasets written by rollout_to_lerobot.py: datasets/<name>/{meta,data,videos}
+# DATASETS: LeRobot datasets written by prism_pi.rollout_to_lerobot: datasets/<name>/{meta,data,videos}
 DATASET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 DEFAULT_DATASET = "rollouts"
 
@@ -189,7 +188,7 @@ class Recorder:
         with self.lock:
             if self.dir is not None:
                 return self.dir
-            self.dir = ROOT / "runs" / f"rec_{time.strftime('%Y%m%d_%H%M%S')}"; self.dir.mkdir(parents=True, exist_ok=True)
+            self.dir = RUNS / f"rec_{time.strftime('%Y%m%d_%H%M%S')}"; self.dir.mkdir(parents=True, exist_ok=True)
             self.files = {n: open(self.dir / f"{n}.mjpeg", "ab") for n in CAMS}; self.idx = {n: [] for n in CAMS}
             self.t0 = time.time(); self.n = 0
             (self.dir / "meta.json").write_text(json.dumps({"t0": self.t0, "tag": tag, "cap_fps": CAP_FPS}))
@@ -265,7 +264,7 @@ def read_heartbeat():
 
 
 class Session:
-    """One executor process at a time, steered through CONTROL. All robot motion stays in yam_executor.py."""
+    """One executor process at a time, steered through CONTROL. All robot motion stays in the executor process."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -357,7 +356,7 @@ class Session:
             if info is None:    # no policy server: start one with the wanted checkpoint already loaded
                 self.busy = self.busy or "server"
                 with open(ROOT / "policy_server.log", "ab") as lf:
-                    subprocess.Popen([PY, "-u", "policy_server.py", "--ckpt", want], cwd=ROOT, stdout=lf, stderr=subprocess.STDOUT,
+                    subprocess.Popen([PY, "-u", "-m", "prism_pi.policy.server", "--ckpt", want], cwd=ROOT, stdout=lf, stderr=subprocess.STDOUT,
                                      env={**os.environ, "HF_HUB_OFFLINE": "1"}, start_new_session=True)
                 t0 = time.time()
                 while (info := policy_client.server_info()) is None or info.get("ckpt") is None:
@@ -372,10 +371,10 @@ class Session:
                 self._write_ctrl("run", task)
                 HEARTBEAT.unlink(missing_ok=True)
                 stamp = time.strftime("%Y%m%d_%H%M%S")
-                self.log_path = ROOT / "runs" / f"ui_{stamp}_{mode}.log"
+                self.log_path = RUNS / f"ui_{stamp}_{mode}.log"
                 self.log_path.parent.mkdir(exist_ok=True)
-                out_dir = ROOT / "runs" if not self.info.get("dry") else Path("/tmp/yam_ui_test")
-                script = ["yam_executor.py"] if not self.info.get("dry") else ["yam_executor_offline_test.py", "--dry", "--out", str(out_dir)]
+                out_dir = RUNS if not self.info.get("dry") else Path("/tmp/yam_ui_test")
+                script = ["-m", "prism_pi.control.executor"] if not self.info.get("dry") else ["-m", "prism_pi.control.offline_test", "--dry", "--out", str(out_dir)]
                 cmd = [PY, "-u", *script, "--task", task, "--duration", str(duration if mode == "timed" else 0),
                        "--ckpt", want, *ck.get("flags", PNP_FLAGS), "--control-file", str(CONTROL), "--run-name", f"ui_{stamp}"]
                 self.info["run_dir"] = str(out_dir / f"ui_{stamp}")
@@ -413,7 +412,7 @@ class Session:
         if recorder.active and info.get("rec_dir") == recorder.dir.name:
             recorder.stop()
         if info.get("dataset") and info.get("run_dir") and info.get("rec_dir"):
-            job = {"dataset": info["dataset"], "run_dir": info["run_dir"], "rec_dir": str(ROOT / "runs" / info["rec_dir"]),
+            job = {"dataset": info["dataset"], "run_dir": info["run_dir"], "rec_dir": str(RUNS / info["rec_dir"]),
                    "meta": {"ckpt_key": info.get("ckpt"), "mode": info.get("mode"), "ui_log": self.log_path.name if self.log_path else None,
                             "grip_assist": info.get("grip_assist"), "frame_sync": info.get("frame_sync"), "smooth": info.get("smooth")},
                    "queued": time.time()}
@@ -423,7 +422,7 @@ class Session:
     def _convert_loop(self):
         while True:
             job = self.convert_q.get()
-            log_path = ROOT / "runs" / f"convert_{time.strftime('%Y%m%d_%H%M%S')}_{job['dataset']}.log"
+            log_path = RUNS / f"convert_{time.strftime('%Y%m%d_%H%M%S')}_{job['dataset']}.log"
             self.convert = {"state": "running", "dataset": job["dataset"], "t": time.time(), "tail": "", "log_file": log_path.name, "episodes": None}
             print(f"[dataset] converting {Path(job['run_dir']).name} + {Path(job['rec_dir']).name} -> datasets/{job['dataset']}", flush=True)
             try:
@@ -431,7 +430,7 @@ class Session:
                     raise RuntimeError(f"no run.npz in {job['run_dir']} (executor did not get to its log?)")
                 if not (Path(job["rec_dir"]) / "meta.json").exists():
                     raise RuntimeError(f"no frame recording at {job['rec_dir']}")
-                cmd = [PY, "-u", "rollout_to_lerobot.py", "--run", job["run_dir"], "--rec", job["rec_dir"],
+                cmd = [PY, "-u", "-m", "prism_pi.rollout_to_lerobot", "--run", job["run_dir"], "--rec", job["rec_dir"],
                        "--root", str(DATASETS / job["dataset"]), "--meta", json.dumps(job["meta"])]
                 with open(log_path, "wb") as lf:
                     lf.write((" ".join(cmd) + "\n").encode())
@@ -442,7 +441,7 @@ class Session:
                     time.sleep(1)
                 self.convert["tail"] = _tail_line(log_path)
                 if proc.returncode != 0:
-                    raise RuntimeError(f"rollout_to_lerobot.py exit {proc.returncode}: {self.convert['tail']}")
+                    raise RuntimeError(f"rollout_to_lerobot exit {proc.returncode}: {self.convert['tail']}")
                 self.convert.update({"state": "done", "episodes": dataset_info(job["dataset"]).get("episodes")})
                 print(f"[dataset] done: {self.convert['tail']}", flush=True)
             except Exception as e:

@@ -3,10 +3,9 @@
 i2rt/
 __pycache__/
 *.pyc
-# per-rig / per-user configuration (examples are tracked)
-rig_mapping.json
-checkpoints.json
-sag_table.json
+# per-rig / per-user configuration (the *.example.json templates are tracked)
+config/*.json
+!config/*.example.json
 # checkpoints and engines
 ckpt/
 trt_cache/

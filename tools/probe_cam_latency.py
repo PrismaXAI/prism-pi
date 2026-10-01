@@ -12,8 +12,8 @@ import argparse, sys, time
 import cv2, numpy as np
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
-from yam_executor import RealArm, LEFT_CAN, RIGHT_CAN, ESTOP_FLAG
-from dryrun_inference import HttpCam
+from prism_pi.control.executor import RealArm, LEFT_CAN, RIGHT_CAN, ESTOP_FLAG
+from prism_pi.rig.hardware import HttpCam
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--n", type=int, default=5)

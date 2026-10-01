@@ -19,8 +19,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parent
-CACHE = ROOT / "trt_cache"
+from prism_pi.paths import TRT_CACHE as CACHE
+
 MASK_MIN = -6.0e4
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 PRECISION = os.environ.get("YAM_TRT_PREFIX_PRECISION", "fp16")
@@ -136,8 +136,7 @@ class TRTPrefix:
 
 # ---------------------------------------------------------------- CLI: export / build / check
 if __name__ == "__main__":
-    sys.path.insert(0, str(ROOT))
-    import relative_actions_compat  # noqa
+    from prism_pi.policy import relative_actions_compat  # noqa
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy, make_att_2d_masks, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.utils import prepare_observation_for_inference

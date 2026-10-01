@@ -1,4 +1,4 @@
-"""Read the raw gripper-motor angles of one arm at fully CLOSED and fully OPEN, for "grip_cal" in rig_mapping.json.
+"""Read the raw gripper-motor angles of one arm at fully CLOSED and fully OPEN, for "grip_cal" in config/rig_mapping.json.
 
 No motion is commanded: motor 7 (the gripper) is enabled for an instant with zero torque just to read its angle and
 switched off again, exactly like the executor's start-up read. YOU move the fingers by hand between the two readings
@@ -24,7 +24,7 @@ TRAIN = {"left": (6.351, 1.45), "right": (6.392, 1.34)}
 
 
 def read_gripper_raw(channel: str) -> float:
-    """Brief zero-torque enable of motor 7 to read its raw angle (no motion). Same sequence as yam_executor.py."""
+    """Brief zero-torque enable of motor 7 to read its raw angle (no motion). Same sequence as the executor's."""
     from i2rt.motor_drivers.dm_driver import ControlMode, DMSingleMotorCanInterface, MotorType
     iface = DMSingleMotorCanInterface(channel=channel, bustype="socketcan", control_mode=ControlMode.MIT)
     info = iface.motor_on(7, MotorType.DM4310)
@@ -51,7 +51,7 @@ def main():
     print(f"   open raw   = {opened:+.3f} rad   (travel {abs(opened - closed):.2f} rad; expect about 5)")
     if abs(opened - closed) < 3.0:
         print("!! travel below 3 rad: the fingers did not move over the full stroke, or the motor wrapped; repeat")
-    print("rig_mapping.json:")
+    print("config/rig_mapping.json:")
     print(f'  "grip_cal": {{ ..., {json.dumps(a.side)}: {json.dumps([round(closed, 3), round(opened, 3), tc, to])} }}')
 
 

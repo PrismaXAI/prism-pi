@@ -7,11 +7,11 @@ cd "$(dirname "$0")"
 PYTHON=${PYTHON:-.venv/bin/python}
 PORT=${YAM_UI_PORT:-8080}
 declare -a TMP
-# CAN adapters are identified by their USB serial and named by what they DRIVE (rig_mapping.json): code convention
+# CAN adapters are identified by their USB serial and named by what they DRIVE (config/rig_mapping.json): code convention
 # LEFT arm = can1, RIGHT arm = can0. Two passes through temporary names so a swap never collides.
 declare -A WANT
-while read -r serial name; do WANT[$serial]=$name; done < <($PYTHON rig_mapping.py can)
-[ "${#WANT[@]}" -gt 0 ] || echo "!! rig_mapping.json has no can_by_serial entries (copy rig_mapping.example.json and fill it in)"
+while read -r serial name; do WANT[$serial]=$name; done < <($PYTHON -m prism_pi.rig.mapping can)
+[ "${#WANT[@]}" -gt 0 ] || echo "!! config/rig_mapping.json has no can_by_serial entries (copy config/rig_mapping.example.json and fill it in)"
 i=0
 for dev in /sys/class/net/can*; do
   [ -e "$dev" ] || continue
@@ -19,7 +19,7 @@ for dev in /sys/class/net/can*; do
   if [ -n "${WANT[$serial]}" ]; then
     sudo ip link set "$cur" down; sudo ip link set "$cur" name "cantmp$i"; TMP[$i]="${WANT[$serial]}"; i=$((i+1))
   else
-    echo "!! $cur has unknown adapter serial '$serial' (not in rig_mapping.json)"
+    echo "!! $cur has unknown adapter serial '$serial' (not in config/rig_mapping.json)"
   fi
 done
 for j in $(seq 0 $((i-1))); do
@@ -29,14 +29,14 @@ done
 sleep 1; ip -br link | grep -E "^can"
 if [ -e ESTOP ]; then echo "!! e-stop latch is set (file ESTOP): press 'Reset latch' in the web UI before starting a session"; fi
 if ! ss -ltn | grep -q ":$PORT "; then
-  YAM_UI_PORT=$PORT setsid nohup $PYTHON -u yam_webui.py >> webui.log 2>&1 < /dev/null &
+  YAM_UI_PORT=$PORT setsid nohup $PYTHON -u -m prism_pi.webui >> webui.log 2>&1 < /dev/null &
   echo "web UI starting on http://$(hostname -I | awk '{print $1}'):$PORT"
 else
   echo "web UI already running"
 fi
 if [ -n "$PRISM_CKPT" ]; then
-  if ! $PYTHON policy_client.py info 2>/dev/null | grep -q "'ckpt'"; then
-    setsid nohup env HF_HUB_OFFLINE=1 $PYTHON -u policy_server.py --ckpt "$PRISM_CKPT" >> policy_server.log 2>&1 < /dev/null &
+  if ! $PYTHON -m prism_pi.policy.client info 2>/dev/null | grep -q "'ckpt'"; then
+    setsid nohup env HF_HUB_OFFLINE=1 $PYTHON -u -m prism_pi.policy.server --ckpt "$PRISM_CKPT" >> policy_server.log 2>&1 < /dev/null &
     echo "policy server starting with $PRISM_CKPT (~1 min)"
   else
     echo "policy server already running"

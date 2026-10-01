@@ -1,12 +1,12 @@
 """Inspect a webui frame recording (runs/rec_<ts>/: <cam>.mjpeg + <cam>.idx.npy + meta.json).
-  rec_tools.py list                                  # recordings with duration / frame counts
-  rec_tools.py sharp <rec> [--cam left_wrist]        # per-frame sharpness + inter-frame motion over time (find blurry moments)
-  rec_tools.py sheet <rec> --t0 12.3 --t1 12.6 [--cam left_wrist] [--every 1]   # contact sheet of frames in [t0, t1] s after start
-  rec_tools.py frames <rec> --t0 12.3 --t1 12.6 --cam high --out dir             # dump PNGs
+  tools/rec_tools.py list                                  # recordings with duration / frame counts
+  tools/rec_tools.py sharp <rec> [--cam left_wrist]        # per-frame sharpness + inter-frame motion over time (find blurry moments)
+  tools/rec_tools.py sheet <rec> --t0 12.3 --t1 12.6 [--cam left_wrist] [--every 1]   # contact sheet of frames in [t0, t1] s after start
+  tools/rec_tools.py frames <rec> --t0 12.3 --t1 12.6 --cam high --out dir             # dump PNGs
 Times are seconds after the recording start (meta t0)."""
 import argparse, glob, json, os
 import numpy as np, cv2
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CAMS = ("high", "left_wrist", "right_wrist")
 
 

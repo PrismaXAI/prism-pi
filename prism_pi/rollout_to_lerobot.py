@@ -1,4 +1,4 @@
-"""Turn a policy rollout (yam_executor.py run + the WebUI's frame recording) into LeRobot v3 episodes.
+"""Turn a policy rollout (an executor run + the WebUI's frame recording) into LeRobot v3 episodes.
 
 The executor logs every 30 Hz tick (run.npz: state read, commanded target, wall-clock time, segment id); the WebUI's
 Recorder keeps every camera frame of the session at the full capture rate (runs/rec_<ts>/: raw JPEGs + capture times).
@@ -19,8 +19,8 @@ to a LeRobot dataset with EXACTLY our training dataset's schema (codebase v3.0, 
 Per-episode provenance goes to <root>/meta/rollouts.jsonl (run dir, recording, segment, checkpoint, frame ages, ...);
 a run+segment already listed there is skipped, so re-running on the same inputs is safe.
 
-  .venv/bin/python rollout_to_lerobot.py --run runs/<stamp> --rec runs/rec_<stamp> --root datasets/rollouts_fruits
-  .venv/bin/python rollout_to_lerobot.py info --root datasets/rollouts_fruits      # episode / frame counts
+  .venv/bin/python -m prism_pi.rollout_to_lerobot --run runs/<stamp> --rec runs/rec_<stamp> --root datasets/rollouts_fruits
+  .venv/bin/python -m prism_pi.rollout_to_lerobot info --root datasets/rollouts_fruits      # episode / frame counts
 """
 
 import argparse
@@ -32,7 +32,6 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
 FPS = 30
 CAMS = ("high", "left_wrist", "right_wrist")
 H, W = 400, 640

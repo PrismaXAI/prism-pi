@@ -7,11 +7,13 @@ hold broke while the close command was still on = the fruit slipped / was squeez
 the simulator's grasp_quality.py lost holds. Closes that never enter the band are 'air' closes.
 Positions: pad centre from FK on the MEASURED joints, cm: x lateral (+ right), y ahead of the base line, h height.
 
-usage: .venv/bin/python rig_run_stats.py runs/<ts> [runs/<ts> ...]
+usage: .venv/bin/python tools/run_stats.py runs/<ts> [runs/<ts> ...]
 """
 import sys
+from pathlib import Path
 import numpy as np
-from arm_arbiter import ZoneArbiter
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from prism_pi.control.arm_arbiter import ZoneArbiter  # noqa: E402
 
 HZ = 30.0
 BAND = (2.4, 4.8)      # gripper state (training-rig rad) with a fruit between the pads (apples 2.5-4.5)

@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-CACHE = Path(__file__).resolve().parent / "trt_cache"
+from prism_pi.paths import TRT_CACHE as CACHE
 
 
 class _ImageEncoder(torch.nn.Module):

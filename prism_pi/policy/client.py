@@ -1,4 +1,4 @@
-"""Client for policy_server.py. RemoteRunner mirrors the executor's Pi05Runner.infer() interface, so the control code
+"""Client for the policy server (server.py). RemoteRunner mirrors the executor's Pi05Runner.infer() interface, so the control code
 does not care whether the model is local or served. No torch import needed on the client side."""
 import os
 from multiprocessing.connection import Client
@@ -75,7 +75,7 @@ def shutdown():
         c.close()
 
 
-if __name__ == "__main__":  # tiny control CLI:  policy_client.py info | load <ckpt> [dtype] | shutdown
+if __name__ == "__main__":  # tiny control CLI:  python -m prism_pi.policy.client info | load <ckpt> [dtype] | shutdown
     import sys
     cmd = sys.argv[1] if len(sys.argv) > 1 else "info"
     if cmd == "info":
@@ -89,4 +89,4 @@ if __name__ == "__main__":  # tiny control CLI:  policy_client.py info | load <c
         except EOFError:
             print("server stopped")
     else:
-        raise SystemExit("usage: policy_client.py info | load <ckpt> [dtype] | shutdown")
+        raise SystemExit("usage: python -m prism_pi.policy.client info | load <ckpt> [dtype] | shutdown")

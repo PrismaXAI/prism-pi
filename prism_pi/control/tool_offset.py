@@ -1,4 +1,4 @@
-"""Tool-frame shifts of commanded arm targets (sim runner; written so the executor can reuse it).
+"""Tool-frame shifts and limits of commanded arm targets (executor side; the yamulator simulator runs the same code).
 
 Motivation (2026-09-19): in sim the policy stops ~1.5-2 cm short along the gripper's x axis (across the pad
 width, +x = the side away from the wrist camera) at grasp onset, for the absolute and the relative checkpoints.
@@ -15,18 +15,17 @@ Two executor-side interventions, both a rigid translation of the gripper in its 
                       policies the advance is held while the gripper command stays closed and ramps back afterwards.
 
 `ToolShifter.shift(side, q6, d_tool)` = a few damped-least-squares steps from q6 (numeric Jacobian on the URDF
-FK, the same arm model as arm_arbiter / the renderer); falls back to q6 if the residual stays above 1 mm.
+FK, the same arm model as arm_arbiter); falls back to q6 if the residual stays above 1 mm.
 """
 from __future__ import annotations
-
-from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
-from .kinematics import GripperCalibration, YamArm, rotation_error
+from prism_pi import paths
+from prism_pi.control.kinematics import GripperCalibration, YamArm, rotation_error
 
-URDF = str(Path(__file__).resolve().parent.parent / "assets/yam/yam.urdf")
+URDF = str(paths.URDF)
 OFF = {"left": 0, "right": 7}
 
 

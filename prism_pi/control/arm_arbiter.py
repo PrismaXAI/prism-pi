@@ -1,4 +1,4 @@
-"""Arm arbitration for the bimanual YAM policy executor / simulator: at most ONE arm in the shared work zone.
+"""Arm arbitration for the bimanual YAM policy executor: at most ONE arm in the shared work zone.
 
 Why: with few fruits both arms reach for the same one; the waiting arm hovers over the plate, blocks the other wrist
 camera and risks gripper/camera collisions. The policy itself takes turns eventually; this makes the turn-taking explicit.
@@ -21,15 +21,15 @@ How (no perception needed, only forward kinematics of both arms):
                 container, so the other arm can already start on the next fruit.
   * timeout   = owner inside the zone for `timeout_s` without commanding a close -> ownership is dropped and that arm
                 is blocked for `cooldown_s`, so a dithering arm cannot starve the other one.
-Pure numpy + the sim's URDF FK; imports nothing from the robot SDK.
+Pure numpy + URDF forward kinematics (kinematics.py); imports nothing from the robot SDK. The yamulator simulator
+runs the same arbiter, which is where its settings were validated.
 """
-from pathlib import Path
-
 import numpy as np
 
-from yamsim.kinematics import GripperCalibration, YamArm
+from prism_pi import paths
+from prism_pi.control.kinematics import GripperCalibration, YamArm
 
-URDF = str(Path(__file__).resolve().parent / "assets/yam/yam.urdf")
+URDF = str(paths.URDF)
 REST = np.array([0.0, 0.0, 0.0, -0.08, 0.0, 0.0])
 SIDES = ("left", "right")
 OFF = {"left": 0, "right": 7}

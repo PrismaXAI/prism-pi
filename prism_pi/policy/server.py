@@ -1,7 +1,7 @@
 """Persistent pi0.5 policy server: keeps one checkpoint loaded in VRAM and serves inference over a local Unix socket,
 so executor / sim / probe runs start in ~1 s instead of paying a ~35 s model load each time.
 
-  setsid nohup env HF_HUB_OFFLINE=1 .venv/bin/python policy_server.py --ckpt <checkpoint dir> > policy_server.log 2>&1 &
+  setsid nohup env HF_HUB_OFFLINE=1 .venv/bin/python -m prism_pi.policy.server --ckpt <checkpoint dir> > policy_server.log 2>&1 &
 
 Protocol (multiprocessing.connection, pickle, authkey): request = dict(op=...), reply = dict(ok=bool, ...).
   ping / info                       -> what is loaded (ckpt, dtype, relative?, follower?, counters, VRAM)
@@ -29,8 +29,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-import relative_actions_compat  # noqa: F401  registers the fork's relative-action step name
-from policy_client import AUTH, SOCK   # one definition of the socket path / auth key for both ends (YAM_POLICY_SOCK overrides)
+from prism_pi.policy import relative_actions_compat  # noqa: F401  registers the fork's relative-action step name
+from prism_pi.policy.client import AUTH, SOCK   # one definition of the socket path / auth key for both ends (YAM_POLICY_SOCK overrides)
 
 PROMPT_MAX_TOKENS = 96   # see load(): prompt padding length (checkpoint default 200)
 PREFIX_LEN = 3 * 256 + PROMPT_MAX_TOKENS   # prefix tokens = 3 images x 256 + prompt; the TensorRT prefix engine is built for exactly this
@@ -86,13 +86,13 @@ class PolicyHost:
             self._prep = self._prep_gpu   # lerobot's prepare_observation_for_inference converts images on the CPU: 52 ms for 3 frames
             # CUDA-graph replay of the denoising step (fast_denoise.py): 10 steps 86 -> ~17 ms, bit-identical output;
             # also sets requires_grad=False on the weights (RTC guidance no longer records a graph: -35 ms).
-            import fast_denoise
+            from prism_pi.policy import fast_denoise
             self.fast = fast_denoise.install(self.policy)
             if TRT_VISION:
                 # TensorRT SigLIP (all 3 images in one engine call): image embedding 18 -> 8 ms (bf16; fp16 6 ms). Not bit-identical
                 # (max |Δ| 0.005 rad on actions, vs 0.033 rad seed-to-seed spread): parity is re-checked after warm-up.
                 try:
-                    import trt_vision
+                    from prism_pi.policy import trt_vision
                     self.fast.trt = trt_vision.TRTImageEncoder(self.policy.model.paligemma_with_expert, 3, TRT_PRECISION, log=lambda m: print(m, flush=True))
                 except Exception as e:
                     print(f"[policy_server] TensorRT vision unavailable, eager SigLIP: {e!r}", flush=True)
@@ -101,11 +101,11 @@ class PolicyHost:
                 # TensorRT fp16 Gemma prefix: fp16-accumulate GEMMs run at full rate on this GPU (bf16 at half rate).
                 # ONNX exported once (trt_prefix.py --export, done on the training rig); the engine is built here per GPU.
                 try:
-                    import trt_prefix
+                    from prism_pi.policy import trt_prefix
                     lm_ = self.policy.model.paligemma_with_expert.paligemma.model.language_model
                     onnx_ = trt_prefix.onnx_path(lm_, PREFIX_LEN, TRT_PREFIX_PRECISION)
                     if not onnx_.exists():
-                        raise FileNotFoundError(f"no exported ONNX {onnx_.name} (run trt_prefix.py --export for this checkpoint)")
+                        raise FileNotFoundError(f"no exported ONNX {onnx_.name} (run python -m prism_pi.policy.trt_prefix --export --build for this checkpoint)")
                     plan_ = trt_prefix.build_engine(onnx_, trt_prefix.plan_path(lm_, PREFIX_LEN, TRT_PREFIX_PRECISION), log=lambda m: print(m, flush=True))
                     self.fast.trt_lm = trt_prefix.TRTPrefix(plan_, PREFIX_LEN, lm_.config.num_hidden_layers, log=lambda m: print(m, flush=True), precision=TRT_PREFIX_PRECISION)
                 except Exception as e:
