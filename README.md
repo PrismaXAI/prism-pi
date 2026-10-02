@@ -33,4 +33,4 @@ Finally, a GeForce-specific quirk is that GeForce-branded GPUs don't really supp
 
 ### About Us
 
-prism-pi is brought to you by [PrismaX](http://prismax.ai). We provide end-to-end services for data collection and model rollout on YAM and other popular embodiments, with over 6000 hours a month of capacity across the most challenging dexterous tasks in the industry, operators with thousands of hours of experience, and sensor, end effector, and scenario customization to meet you and your researchers' needs.
+`prism-pi` is brought to you by [PrismaX](http://prismax.ai). We provide end-to-end services for data collection and model rollout on YAM and other popular embodiments, with over 6000 hours a month of capacity across the most challenging dexterous tasks in the industry, operators with thousands of hours of experience, and sensor, end effector, and scenario customization to meet you and your researchers' needs.
