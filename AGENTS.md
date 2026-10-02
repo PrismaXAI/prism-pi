@@ -302,9 +302,9 @@ Rig geometry matters as much as software. What we measured, in the simulator and
 | `assets/yam/yam.urdf` | arm kinematics for the FK-based limits |
 | `rig_up.sh`, `patches/` | station start-up; optional patch for the i2rt SDK |
 
-Counterparts in `yamulator`: the simulator runs the same control and client code under its own paths
-(`arm_arbiter.py`, `yamsim/tool_offset.py`, `yamsim/kinematics.py`, `sag_comp.py`, `policy_client.py`,
-`relative_actions_compat.py`, `tools/make_ckpt_shim.py`, `constraints.txt`). The copies differ only in imports and
+Counterparts in `yamulator`: the simulator runs the same control and client code as `yamulator/control/`
+(`arm_arbiter.py`, `tool_offset.py`, `sag_comp.py`), `yamulator/sim/kinematics.py`, `yamulator/policy/` (`client.py`,
+`relative_actions_compat.py`), `tools/make_ckpt_shim.py` and `constraints.txt`. The copies differ only in imports and
 file locations. A change to the logic of one belongs in both, so that what the simulator validates is what the
 executor runs; say so when you make one. The policy server's socket protocol is the interface between the repos.
 
