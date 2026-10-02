@@ -116,18 +116,48 @@ If loading fails on an unknown `config.json` key (checkpoints saved by a newer o
     HF_HUB_OFFLINE=1 setsid nohup .venv/bin/python -u -m prism_pi.policy.server --ckpt ckpt/fruits_004000 > policy_server.log 2>&1 < /dev/null &
     .venv/bin/python -m prism_pi.policy.client info        # prints the loaded checkpoint once it is up (about 1 min)
 
-In `policy_server.log` expect `ready: {...}` and `TensorRT vision ON (parity ...)`. The vision engine is built on
-first load (1-3 min, cached in `trt_cache/`). The Gemma prefix engine is optional and needs a one-time export per
-checkpoint (about 1 min and 7 GB of disk on the RTX 5090; stop the server first, it needs the VRAM):
+In `policy_server.log` expect `ready: {...}` and `TensorRT vision ON (parity ...)`. Three stages of an inference can
+run as TensorRT engines; without any of them everything still works, slower.
+
+| stage | engine | how it gets built | switches |
+|---|---|---|---|
+| vision (SigLIP on the 3 images) | `trt_vision.py` | automatically on first load (1-3 min, cached in `trt_cache/`) | `YAM_TRT_VISION=0` to disable; `YAM_TRT_PRECISION=bf16` (default) or `fp16` |
+| prefix (Gemma, fills the KV cache) | `trt_prefix.py` | one-time export per checkpoint, below (about 1 min, 7 GB of disk) | `YAM_TRT_PREFIX=0`; `YAM_TRT_PREFIX_PRECISION=fp16` (default) or `bf16` |
+| action expert (the 10 flow-matching steps) | `trt_expert.py` | one-time export per checkpoint, below (under 1 min, 1.6 GB) | **opt-in**: `YAM_TRT_EXPERT=1`; `YAM_TRT_EXPERT_PRECISION=fp16` (default) or `bf16` |
+
+Exports (stop the server first, they need the VRAM; each precision is its own export):
 
     HF_HUB_OFFLINE=1 .venv/bin/python -m prism_pi.policy.trt_prefix --ckpt ckpt/fruits_004000 --export --build --check
+    HF_HUB_OFFLINE=1 .venv/bin/python -m prism_pi.policy.trt_expert --ckpt ckpt/fruits_004000 --export --build --check
 
-after which the server logs `TensorRT prefix ON`. Each engine is kept only if its actions stay within the
-seed-to-seed spread of eager PyTorch; otherwise the server logs `OFF` and uses PyTorch for that stage. Without
-any engine everything still works, slower (RTX 5090 laptop: about 110 ms per inference eager, about 85 ms with
-both engines).
-`YAM_TRT_VISION=0 YAM_TRT_PREFIX=0` disables them. Stop the server with
-`.venv/bin/python -m prism_pi.policy.client shutdown`.
+`--check` prints the engine's deviation from the PyTorch path and counts non-finite outputs (must be 0). The
+switches are environment variables of the server process: when the UI starts the server it inherits the UI's
+environment, so set them where `rig_up.sh` / the UI is launched, e.g. `YAM_TRT_EXPERT=1 ./rig_up.sh`.
+
+At load the server compares each engine's actions with the PyTorch path on the same seed and keeps the engine only
+if they are finite and well inside the seed-to-seed spread; the log says `TensorRT <stage> ON (parity ...)` or `OFF`.
+At run time a request whose actions are not finite fails instead of returning them (the executor parks on a failed
+inference) and the expert engine is dropped for the following requests.
+
+Server-side latency per inference on the RTX 5090 laptop, RTC on (median of 300, logged rig observations):
+
+| configuration | latency |
+|---|---|
+| PyTorch only (bf16, CUDA-graph denoising) | about 110 ms |
+| vision bf16 + prefix fp16 engines (the default once the prefix is exported) | 80 ms |
+| + expert bf16 engine | 74 ms |
+| + expert fp16 engine | 66 ms |
+| vision, prefix and expert all fp16 (`YAM_TRT_PRECISION=fp16 YAM_TRT_EXPERT=1`) | 63 ms |
+
+Against a pure fp32 PyTorch reference on 120 logged observations (same noise seed), every configuration above stays
+within 0.004-0.007 rad (median of the per-chunk maximum over arm joints; two different noise seeds differ by 0.29 rad),
+the expert engines included, and none produced a NaN or Inf, also on 100 off-distribution inputs. The expert engine
+In closed loop (`yamulator` through this server, 30 paired scenes per configuration, RTC + arbitration) the lift
+counts were 22 of 30 without the expert engine and 23 to 26 with it (fp16, bf16, all-fp16): no difference beyond the
+run-to-run noise of that sample size. The expert engine is opt-in because it is the newest stage and has not run on
+the rig yet: turn it on after `--check` passes for your checkpoint, and judge it by rollouts (simulator, then rig).
+
+Stop the server with `.venv/bin/python -m prism_pi.policy.client shutdown`.
 One model at a time: while the server is up, loading the model in another process can run out of VRAM.
 
 ### 6. Rig mapping (needs the hardware, no motion)
@@ -263,7 +293,7 @@ Rig geometry matters as much as software. What we measured, in the simulator and
 |---|---|
 | `prism_pi/webui.py` | operator UI, camera capture (one ffmpeg per camera), e-stop, session control, frame recorder |
 | `prism_pi/control/` | `executor.py` (the control loop; `offline_test.py` = the same loop on stub arms) and the command shaping it applies: `arm_arbiter.py` (one arm at a time in the shared zone), `tool_offset.py` (downward-speed cap, pre-close advance), `kinematics.py` (URDF forward kinematics / IK those two need), `sag_comp.py` |
-| `prism_pi/policy/` | `server.py` and `client.py` (`info`, `load <ckpt>`, `shutdown`), server-side acceleration (`fast_denoise.py` CUDA graph, `trt_vision.py` / `trt_prefix.py` TensorRT engines in `trt_cache/`), `relative_actions_compat.py` |
+| `prism_pi/policy/` | `server.py` and `client.py` (`info`, `load <ckpt>`, `shutdown`), server-side acceleration (`fast_denoise.py` CUDA graph, `trt_vision.py` / `trt_prefix.py` / `trt_expert.py` TensorRT engines in `trt_cache/`), `relative_actions_compat.py` |
 | `prism_pi/rig/` | `mapping.py` (reads `config/rig_mapping.json`), `hardware.py` (zero-torque arm reader, camera sources, CAN names, `GRIP_CAL`), `dryrun.py` (passive inference check) |
 | `prism_pi/rollout_to_lerobot.py` | rollout + frame recording -> LeRobot dataset |
 | `prism_pi/paths.py` | every file location (config, e-stop latch, state files, outputs) in one place |

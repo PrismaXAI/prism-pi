@@ -57,6 +57,7 @@ class GraphedDenoiser:
         self.n_replays = 0
         self.trt = None        # optional TensorRT image encoder (trt_vision.TRTImageEncoder): all 3 images in one call
         self.trt_lm = None     # optional TensorRT Gemma prefix (trt_prefix.TRTPrefix): the 18-layer pass that fills the KV cache
+        self.trt_expert = None  # optional TensorRT action expert (trt_expert.TRTExpert): one engine call per denoising step
 
     def embed_prefix(self, images, img_masks, tokens, masks):
         """PI05FlowMatching.embed_prefix with the image loop replaced by one batched TensorRT call."""
@@ -124,16 +125,23 @@ class GraphedDenoiser:
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = m._prepare_attention_masks_4d(prefix_att_2d_masks)
+        use_trt_expert = self.trt_expert is not None and bsize == 1 and prefix_embs.shape[1] == self.trt_expert.L
         if self.trt_lm is not None and bsize == 1 and prefix_embs.shape[1] == self.trt_lm.L:
-            past_key_values = self.trt_lm(prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids)
+            # with a TensorRT expert of the same dtype the KV cache stays in the prefix engine's buffers (no PyTorch copy)
+            direct = use_trt_expert and self.trt_lm.dt == self.trt_expert.dt
+            past_key_values = self.trt_lm(prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids, as_cache=not direct)
+            if use_trt_expert:
+                self.trt_expert.load(prefix_pad_masks, past_key_values, self.trt_lm)
         else:
             m.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"
             _, past_key_values = m.paligemma_with_expert.forward(
                 attention_mask=prefix_att_2d_masks_4d, position_ids=prefix_position_ids, past_key_values=None,
                 inputs_embeds=[prefix_embs, None], use_cache=True)
+            if use_trt_expert:
+                self.trt_expert.load(prefix_pad_masks, past_key_values)
 
         x_t = noise
-        use_graph = self.ok and bsize == 1
+        use_graph = self.ok and bsize == 1 and not use_trt_expert
         if use_graph:
             try:
                 shape = (tuple(prefix_pad_masks.shape), tuple(x_t.shape), tuple(past_key_values.layers[0].keys.shape))
@@ -148,7 +156,10 @@ class GraphedDenoiser:
         dt = -1.0 / num_steps
         for step in range(num_steps):
             time = 1.0 + step * dt
-            if use_graph:
+            if use_trt_expert:
+                def denoise_step_partial_call(input_x_t, _t=time):
+                    return self.trt_expert.step(input_x_t, _t)
+            elif use_graph:
                 def denoise_step_partial_call(input_x_t, _t=time):
                     return self._step(input_x_t, _t)
             else:

@@ -38,6 +38,8 @@ TRT_VISION = os.environ.get("YAM_TRT_VISION", "1") == "1"   # TensorRT SigLIP (t
 TRT_PRECISION = os.environ.get("YAM_TRT_PRECISION", "bf16")   # bf16 = same dtype as the rest of the model (fp16 is ~2 ms faster)
 TRT_PREFIX = os.environ.get("YAM_TRT_PREFIX", "1") == "1"      # TensorRT Gemma prefix (trt_prefix.py); needs the ONNX in trt_cache/
 TRT_PREFIX_PRECISION = os.environ.get("YAM_TRT_PREFIX_PRECISION", "fp16")   # fp16 | bf16 (each needs its own export)
+TRT_EXPERT = os.environ.get("YAM_TRT_EXPERT", "0") == "1"      # TensorRT action expert (trt_expert.py), opt-in; needs the ONNX in trt_cache/
+TRT_EXPERT_PRECISION = os.environ.get("YAM_TRT_EXPERT_PRECISION", "fp16")   # fp16 | bf16 (each needs its own export)
 IMG_KEYS = ("high", "left_wrist", "right_wrist")
 
 
@@ -66,7 +68,7 @@ class PolicyHost:
                 fast = getattr(self, "fast", None)
                 if fast is not None:
                     fast.graph = None; fast.s_cache = None; fast.s_out = None; fast.s_x = None
-                    fast.trt = None; fast.trt_lm = None
+                    fast.trt = None; fast.trt_lm = None; fast.trt_expert = None
                     self.fast = None
                 del self.policy, self.pre, self.post
                 self.policy = None
@@ -111,6 +113,22 @@ class PolicyHost:
                 except Exception as e:
                     print(f"[policy_server] TensorRT prefix unavailable, eager Gemma: {e!r}", flush=True)
                     self.fast.trt_lm = None
+            if TRT_EXPERT:
+                # TensorRT action expert: one engine call per denoising step instead of a CUDA-graph replay of the bf16
+                # PyTorch step (RTX 5090 laptop: 4.4 -> 2.4 ms per step in fp16). ONNX exported once per checkpoint
+                # (python -m prism_pi.policy.trt_expert --export); the engine is built here per GPU. With an fp16 prefix
+                # engine the fp16 expert reads the KV cache straight from its output buffers.
+                try:
+                    from prism_pi.policy import trt_expert
+                    m_ = self.policy.model
+                    onnx_ = trt_expert.onnx_path(m_, PREFIX_LEN, TRT_EXPERT_PRECISION)
+                    if not onnx_.exists():
+                        raise FileNotFoundError(f"no exported ONNX {onnx_.name} (run python -m prism_pi.policy.trt_expert --export --build for this checkpoint)")
+                    plan_ = trt_expert.build_engine(onnx_, trt_expert.plan_path(m_, PREFIX_LEN, TRT_EXPERT_PRECISION), log=lambda m: print(m, flush=True))
+                    self.fast.trt_expert = trt_expert.TRTExpert(plan_, m_, PREFIX_LEN, TRT_EXPERT_PRECISION, log=lambda m: print(m, flush=True))
+                except Exception as e:
+                    print(f"[policy_server] TensorRT expert unavailable, CUDA-graph PyTorch expert: {e!r}", flush=True)
+                    self.fast.trt_expert = None
             # Prompt padding: the checkpoint pads the prompt to 200 tokens, the real prompt (task + discretized state)
             # is ~60 → 140 masked pad tokens in every prefix. 96 keeps a margin for all task strings/states: -5 ms,
             # max |Δ| 0.003 rad (masked positions only change bf16 reduction order). Guarded against truncation below.
@@ -137,7 +155,7 @@ class PolicyHost:
         for _ in range(2):
             self.infer(z, s, "Pick and place various fruits into containers")
         # parity checks of the TensorRT stages against eager PyTorch (same seed, 3 random observations): each stage is
-        # kept only if the actions it produces stay well inside the seed-to-seed spread (~0.03-0.07 rad)
+        # kept only if the actions it produces are finite and stay well inside the seed-to-seed spread (~0.03-0.07 rad)
         A = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
         obs_chk = []
         for k in range(3):
@@ -145,13 +163,13 @@ class PolicyHost:
             ss = s + rng.normal(0, 0.05, 14).astype(np.float32) * np.r_[np.ones(6), 0, np.ones(6), 0].astype(np.float32)
             obs_chk.append((zz, ss))
         def _acts():
-            return [self.infer(zz, ss, "Pick and place various fruits into containers", seed=0)["chunks"][0] for zz, ss in obs_chk]
-        for stage, attr, thr in (("vision", "trt", 0.02), ("prefix", "trt_lm", 0.03)):
+            return [self.infer(zz, ss, "Pick and place various fruits into containers", seed=0, check_finite=False)["chunks"][0] for zz, ss in obs_chk]
+        for stage, attr, thr in (("vision", "trt", 0.02), ("prefix", "trt_lm", 0.03), ("expert", "trt_expert", 0.03)):
             eng = getattr(self.fast, attr, None)
             if eng is None:
                 continue
             with_ = _acts(); setattr(self.fast, attr, None); without = _acts()
-            d = float(np.mean([np.abs(a_ - b_)[:, A].max() for a_, b_ in zip(with_, without)]))
+            d = float(np.mean([np.abs(a_ - b_)[:, A].max() for a_, b_ in zip(with_, without)]))   # NaN/Inf in either -> not < thr -> OFF
             if d < thr:
                 setattr(self.fast, attr, eng)
                 print(f"[policy_server] TensorRT {stage} ON (parity max |Δ| {d:.4f} rad, mean over 3 obs)", flush=True)
@@ -178,7 +196,7 @@ class PolicyHost:
         return out
 
     @torch.no_grad()   # not inference_mode: RTC guidance re-enables autograd internally
-    def infer(self, frames: dict, state, task: str, n_samples: int = 1, seed=None, rtc=None, num_steps=None):
+    def infer(self, frames: dict, state, task: str, n_samples: int = 1, seed=None, rtc=None, num_steps=None, check_finite=True):
         if self.policy is None:
             raise RuntimeError("no checkpoint loaded")
         t0 = time.perf_counter()
@@ -212,6 +230,13 @@ class PolicyHost:
                 norm = self.policy.predict_action_chunk(batch, **kw)     # (K, 50, 14) normalized
             torch.cuda.synchronize(); t3 = time.perf_counter()
             chunks = self.post(norm.float()).float().cpu().numpy()      # absolute actions
+            if check_finite and not np.isfinite(chunks).all():
+                # never hand NaN/Inf targets to a controller: the request fails (the executor parks on a failed inference)
+                # and a TensorRT expert, the stage most exposed to fp16 overflow, is dropped for the following requests
+                if getattr(self.fast, "trt_expert", None) is not None:
+                    self.fast.trt_expert = None
+                    print("[policy_server] non-finite actions: TensorRT expert disabled, back to the PyTorch expert", flush=True)
+                raise RuntimeError("model produced non-finite actions")
             self.meta["n_infer"] += 1
         return {"chunks": chunks, "norm": norm.float().cpu().numpy(), "latency_s": time.perf_counter() - t0,
                 "timing_ms": {"prep": (t1 - t0) * 1000, "pre": (t2 - t1) * 1000, "model": (t3 - t2) * 1000, "post": (time.perf_counter() - t3) * 1000}}

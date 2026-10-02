@@ -119,7 +119,9 @@ class TRTPrefix:
         self.n_calls = 0
         log(f"[trt_prefix] engine {Path(plan).name}: L={L}, keys {kshape}")
 
-    def __call__(self, inputs_embeds, attention_mask_4d, position_ids, out_dtype=torch.bfloat16):
+    def __call__(self, inputs_embeds, attention_mask_4d, position_ids, out_dtype=torch.bfloat16, as_cache=True):
+        """as_cache=False: leave the result in self.keys / self.values (for trt_expert, which binds those buffers) and
+        return None instead of building a DynamicCache of out_dtype copies for the PyTorch expert."""
         from transformers.cache_utils import DynamicCache
         assert inputs_embeds.shape[1] == self.L, f"engine built for L={self.L}, got {inputs_embeds.shape[1]}"
         self.x.copy_(inputs_embeds[0:1])
@@ -128,6 +130,8 @@ class TRTPrefix:
         if not self.ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream):
             raise RuntimeError("TensorRT prefix execute failed")
         self.n_calls += 1
+        if not as_cache:
+            return None
         cache = DynamicCache()
         for i in range(self.keys.shape[0]):
             cache.update(self.keys[i].to(out_dtype), self.values[i].to(out_dtype), i)
