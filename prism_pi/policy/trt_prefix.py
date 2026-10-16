@@ -66,7 +66,7 @@ def export_onnx(policy, L: int = 864, precision: str = PRECISION, log=print, fp:
     if path.exists():
         return path
     dt = DTYPES[precision]
-    lm.to(dt).eval()
+    lm.to(device="cuda", dtype=dt).eval()   # only the language model needs the GPU for the export
     mod = _PrefixKV(lm, clamp_mask=(precision == "fp16")).eval()
     D = lm.config.hidden_size
     x = torch.zeros(1, L, D, dtype=dt, device="cuda")
@@ -91,7 +91,8 @@ def build_engine(onnx: Path, plan: Path, log=print) -> Path:
     if not parser.parse_from_file(str(onnx)):
         raise RuntimeError("ONNX parse failed: " + "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
     cfg = builder.create_builder_config()
-    cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
+    from prism_pi.policy.trt_vision import workspace_bytes
+    cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes(8 << 30))   # 8 GiB, or what is free minus 1 GiB
     t0 = time.time()
     blob = builder.build_serialized_network(net, cfg)
     if blob is None:
@@ -152,7 +153,8 @@ if __name__ == "__main__":
     ap.add_argument("--n", type=int, default=6)
     ap.add_argument("--precision", default=PRECISION, choices=list(DTYPES))
     a = ap.parse_args(); PRECISION = a.precision
-    pol = PI05Policy.from_pretrained(a.ckpt).to("cuda").eval().to(torch.bfloat16)
+    from prism_pi.policy.fast_denoise import load_policy_on_host
+    pol = load_policy_on_host(a.ckpt, bf16=True).to("cuda")   # bf16, LM heads dropped, built on the host: the fp32 model never sits on the GPU (16 GB cards)
     for p in pol.parameters(): p.requires_grad_(False)
     pre, post = make_pre_post_processors(pol.config, a.ckpt)
     for s in pre.steps:

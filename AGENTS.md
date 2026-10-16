@@ -50,8 +50,13 @@ This software moves two robot arms. For an agent:
 
 1. The rig: two YAM arms with linear 4310 grippers, one USB-CAN adapter per arm (socketcan, 1 Mbit/s), three
    UVC cameras (overhead "high", left wrist, right wrist) that deliver 1920x1200 MJPEG; `sudo` for `ip link`.
-2. A Linux x86_64 machine with an NVIDIA GPU. Tested: RTX 5090 laptop, 24 GB. The server holds the model in
-   bf16 (about 8 GiB plus engines); loading a model without the server needs about 16 GB.
+2. A Linux x86_64 machine with an NVIDIA GPU with 16 GB or more (tested on an RTX 5090 laptop, 24 GB, also with
+   the free memory capped at 15.5 GiB to stand in for an RTX 5070 Ti). The server needs about 7 GiB of GPU memory
+   in steady state and peaks at about 11 GiB while loading: bf16 weights, the two unused LM heads dropped, the
+   PyTorch twins of the TensorRT stages parked in host RAM (`YAM_OFFLOAD_REPLACED=0` keeps them on the GPU, about
+   4.5 GiB more). The model is built and cast in host RAM first, so the load needs about 24 GB of free host RAM.
+   Loading the model OUTSIDE the server (`--server off`, the simulator's local runner) still puts the fp32 model on
+   the GPU, about 16 GB: on a 16 GB card always go through the server.
 3. `ffmpeg`, `v4l2` devices under `/dev/v4l/by-path`, `git`, [`uv`](https://docs.astral.sh/uv/).
 4. A pi0.5 checkpoint in LeRobot format whose training data follows the conventions in "Checkpoint and rig
    conventions". No checkpoint ships with this repository: ask the user where theirs is and which task strings
@@ -125,7 +130,8 @@ run as TensorRT engines; without any of them everything still works, slower.
 | prefix (Gemma, fills the KV cache) | `trt_prefix.py` | one-time export per checkpoint, below (about 1 min, 7 GB of disk) | `YAM_TRT_PREFIX=0`; `YAM_TRT_PREFIX_PRECISION=fp16` (default) or `bf16` |
 | action expert (the 10 flow-matching steps) | `trt_expert.py` | one-time export per checkpoint, below (under 1 min, 1.6 GB) | **opt-in**: `YAM_TRT_EXPERT=1`; `YAM_TRT_EXPERT_PRECISION=fp16` (default) or `bf16` |
 
-Exports (stop the server first, they need the VRAM; each precision is its own export):
+Exports (stop the server first, they need the VRAM; each precision is its own export; the tools build the model in
+host RAM and need about 7 GiB of GPU memory plus the TensorRT builder's workspace, which is capped at what is free):
 
     HF_HUB_OFFLINE=1 .venv/bin/python -m prism_pi.policy.trt_prefix --ckpt ckpt/fruits_004000 --export --build --check
     HF_HUB_OFFLINE=1 .venv/bin/python -m prism_pi.policy.trt_expert --ckpt ckpt/fruits_004000 --export --build --check
@@ -159,6 +165,9 @@ the rig yet: turn it on after `--check` passes for your checkpoint, and judge it
 
 Stop the server with `.venv/bin/python -m prism_pi.policy.client shutdown`.
 One model at a time: while the server is up, loading the model in another process can run out of VRAM.
+`client info` reports `gpu_used_gib` (whole device, as nvidia-smi sees it) next to `vram_gib` (torch tensors only;
+the TensorRT engines live outside that count). Engines that are not cached yet are built BEFORE the model is moved
+to the GPU, so a first start on a new GPU takes a few minutes longer but needs no more memory than a warm start.
 
 ### 6. Rig mapping (needs the hardware, no motion)
 
@@ -328,7 +337,8 @@ Not tracked (see `.gitignore`): `.venv/`, `i2rt/`, `config/*.json` other than th
   calibration (Setup 7), or power-cycle the arm with the gripper fully open.
 - **"Failed to communicate with motor N" / chain dead mid-run**: wiring at the arm's distal joints or a faulted
   motor; the executor stops commanding and the arm goes limp. Power-cycle the arm and its adapter, `./rig_up.sh`.
-- **CUDA out of memory**: two processes hold a model. Use `--server on` everywhere or stop the server.
+- **CUDA out of memory**: two processes hold a model. Use `--server on` everywhere or stop the server. On a 16 GB
+  card only the server fits (see "What you need"); a local load (`--server off`) does not.
 - **Policy reaches but closes beside or above the object, or hesitates**: tokenizer, then camera framing against
   training frames, then the state convention and gripper calibration, then lighting. Reproduce it in `yamulator`
   before changing executor code.

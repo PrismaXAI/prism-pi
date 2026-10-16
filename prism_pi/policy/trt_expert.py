@@ -129,7 +129,8 @@ def build_engine(onnx: Path, plan: Path, log=print) -> Path:
     if not parser.parse_from_file(str(onnx)):
         raise RuntimeError("ONNX parse failed: " + "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
     cfg = builder.create_builder_config()
-    cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
+    from prism_pi.policy.trt_vision import workspace_bytes
+    cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes(8 << 30))   # 8 GiB, or what is free minus 1 GiB
     t0 = time.time()
     blob = builder.build_serialized_network(net, cfg)
     if blob is None:
@@ -218,7 +219,8 @@ if __name__ == "__main__":
     ap.add_argument("--n", type=int, default=6)
     ap.add_argument("--precision", default=PRECISION, choices=list(DTYPES))
     a = ap.parse_args()
-    pol = PI05Policy.from_pretrained(a.ckpt).to("cuda").eval()          # fp32 weights: what the engine is exported from
+    from prism_pi.policy.fast_denoise import load_policy_on_host
+    pol = load_policy_on_host(a.ckpt, bf16=False)          # fp32 weights ON THE HOST: what the engine is exported from (the export copies only the expert to the GPU)
     for p in pol.parameters(): p.requires_grad_(False)
     m = pol.model
     fp0 = _fingerprint(m)
@@ -229,7 +231,7 @@ if __name__ == "__main__":
     if a.check:
         from PIL import Image
         import glob as _glob
-        pol.to(torch.bfloat16)                                           # the server's PyTorch path: bf16 weights + autocast
+        pol.to(torch.bfloat16); pol.to("cuda")                           # the server's PyTorch path: bf16 weights + autocast (cast on the host, 16 GB cards)
         pre, post = make_pre_post_processors(pol.config, a.ckpt)
         for s in pre.steps:
             if type(s).__name__ == "TokenizerProcessorStep":

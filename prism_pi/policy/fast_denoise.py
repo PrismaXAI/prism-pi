@@ -13,6 +13,7 @@ grad), so no autograd through the network is needed; parameters are set to requi
 Verified 2026-09-21: max |Δ| vs eager 0 rad (same seed), step 8.6 -> ~1.7 ms.
 """
 import contextlib
+import time as _time
 
 import torch
 from transformers.cache_utils import DynamicCache
@@ -20,6 +21,46 @@ from transformers.cache_utils import DynamicCache
 import math
 
 from lerobot.policies.pi05.modeling_pi05 import make_att_2d_masks
+
+
+def drop_lm_heads(policy, log=print):
+    """pi0.5 inference reads hidden states, never logits: the two 257k-vocabulary output projections in the checkpoint
+    (PaliGemma 527M parameters, action expert 263M) are dead weight. The PaliGemma one is tied to the token embedding
+    (dropping it frees nothing, the embedding stays); the expert's is a free-standing matrix: 0.5 GiB in bf16, 1 GiB in
+    fp32. Call it before the model is moved to the GPU."""
+    pwe = policy.model.paligemma_with_expert
+    freed = 0
+    emb = pwe.paligemma.model.language_model.embed_tokens.weight
+    for owner in (pwe.paligemma, pwe.gemma_expert):
+        head = getattr(owner, "lm_head", None)
+        if head is None:
+            continue
+        if head.weight.data_ptr() != emb.data_ptr():
+            freed += head.weight.numel()
+        owner.lm_head = None
+    log(f"[fast_denoise] dropped the unused LM heads ({freed / 1e6:.0f}M free-standing parameters)")
+
+
+def load_policy_on_host(ckpt: str, bf16: bool = True, log=print):
+    """PI05Policy.from_pretrained with the model built, filled and (bf16=True) cast in HOST RAM, LM heads dropped;
+    returned on the CPU, in eval mode: move it with .to("cuda") once the GPU holds nothing it would collide with.
+    PI05Policy.__init__ moves the freshly initialised model to config.device before the weights are even read, which
+    used to put the fp32 model (16.6 GB) on the GPU. Built in bf16 (LeRobot keeps SigLIP and the norms fp32 at
+    construction; the full cast afterwards rounds every weight fp32 -> bf16 exactly once, bit-identical to casting a
+    loaded fp32 model), so the host peak is ~24 GB (state dict + model) instead of 33."""
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+    cfg = PreTrainedConfig.from_pretrained(ckpt)
+    saved_device, saved_dtype = cfg.device, cfg.dtype
+    cfg.device = "cpu"
+    if bf16:
+        cfg.dtype = "bfloat16"
+    policy = PI05Policy.from_pretrained(ckpt, config=cfg)
+    policy.config.device, policy.config.dtype = saved_device, saved_dtype   # as saved: the processors read config.device
+    drop_lm_heads(policy, log)
+    if bf16:
+        policy.to(torch.bfloat16)
+    return policy.eval()
 
 
 @contextlib.contextmanager
@@ -58,13 +99,33 @@ class GraphedDenoiser:
         self.trt = None        # optional TensorRT image encoder (trt_vision.TRTImageEncoder): all 3 images in one call
         self.trt_lm = None     # optional TensorRT Gemma prefix (trt_prefix.TRTPrefix): the 18-layer pass that fills the KV cache
         self.trt_expert = None  # optional TensorRT action expert (trt_expert.TRTExpert): one engine call per denoising step
+        self.offloaded = {}     # stage -> PyTorch modules parked in host RAM while an engine serves (policy_server fills it)
+
+    def restore(self, stage: str, why: str, drop_engine: bool = False):
+        """Bring a stage's PyTorch modules back to the GPU (the policy server parks the twins of confirmed engines in
+        host RAM, see policy_server._offload_replaced); drop_engine also retires the engine for all later requests."""
+        if drop_engine:
+            setattr(self, {"vision": "trt", "prefix": "trt_lm"}[stage], None)
+        mods = self.offloaded.pop(stage, None)
+        if mods:
+            t0 = _time.perf_counter()
+            for mod in mods:
+                mod.to("cuda")
+            torch.cuda.synchronize()
+            print(f"[fast_denoise] {stage}: PyTorch weights back on the GPU ({why}, {_time.perf_counter() - t0:.1f} s)", flush=True)
 
     def embed_prefix(self, images, img_masks, tokens, masks):
         """PI05FlowMatching.embed_prefix with the image loop replaced by one batched TensorRT call."""
         m = self.m
-        if self.trt is None or len(images) != self.trt.batch:
+        if self.trt is None or len(images) != self.trt.batch or images[0].shape[0] != 1:   # the engine takes one observation
+            self.restore("vision", "eager image embedding needed" if self.trt is None else "batched request")
             return m.embed_prefix(images, img_masks, tokens, masks)
-        feats = self.trt(images)
+        try:
+            feats = self.trt(images)
+        except Exception as e:   # never fail an inference over an engine
+            print(f"[fast_denoise] TensorRT vision failed, eager SigLIP from now on: {e!r}", flush=True)
+            self.restore("vision", "engine failure", drop_engine=True)
+            return m.embed_prefix(images, img_masks, tokens, masks)
         embs, pad_masks, att = [], [], []
         for f, img_mask in zip(feats, img_masks):
             f = f.to(tokens.device)
@@ -119,6 +180,10 @@ class GraphedDenoiser:
             num_steps = m.config.num_inference_steps
         bsize = tokens.shape[0]
         device = tokens.device
+        # LeRobot's _preprocess_images puts the image masks (and padded missing cameras) on the device of the model's
+        # FIRST parameter, a SigLIP weight, which may be parked in host RAM (policy_server._offload_replaced)
+        images = [im.to(device) for im in images]
+        img_masks = [mk.to(device) for mk in img_masks]
         if noise is None:
             noise = m.sample_noise((bsize, m.config.chunk_size, m.config.max_action_dim), device)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
@@ -126,13 +191,20 @@ class GraphedDenoiser:
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = m._prepare_attention_masks_4d(prefix_att_2d_masks)
         use_trt_expert = self.trt_expert is not None and bsize == 1 and prefix_embs.shape[1] == self.trt_expert.L
+        prefix_done = False
         if self.trt_lm is not None and bsize == 1 and prefix_embs.shape[1] == self.trt_lm.L:
             # with a TensorRT expert of the same dtype the KV cache stays in the prefix engine's buffers (no PyTorch copy)
             direct = use_trt_expert and self.trt_lm.dt == self.trt_expert.dt
-            past_key_values = self.trt_lm(prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids, as_cache=not direct)
-            if use_trt_expert:
+            try:
+                past_key_values = self.trt_lm(prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids, as_cache=not direct)
+                prefix_done = True
+            except Exception as e:   # never fail an inference over an engine
+                print(f"[fast_denoise] TensorRT prefix failed, eager Gemma from now on: {e!r}", flush=True)
+                self.restore("prefix", "engine failure", drop_engine=True)
+            if prefix_done and use_trt_expert:
                 self.trt_expert.load(prefix_pad_masks, past_key_values, self.trt_lm)
-        else:
+        if not prefix_done:
+            self.restore("prefix", "eager prefix pass needed" if self.trt_lm is None else "batched request")
             m.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"
             _, past_key_values = m.paligemma_with_expert.forward(
                 attention_mask=prefix_att_2d_masks_4d, position_ids=prefix_position_ids, past_key_values=None,

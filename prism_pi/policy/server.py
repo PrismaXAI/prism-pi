@@ -5,7 +5,7 @@ so executor / sim / probe runs start in ~1 s instead of paying a ~35 s model loa
 
 Protocol (multiprocessing.connection, pickle, authkey): request = dict(op=...), reply = dict(ok=bool, ...).
   ping / info                       -> what is loaded (ckpt, dtype, relative?, follower?, counters, VRAM)
-  load(ckpt, dtype="bf16")          -> hot-swap the checkpoint (one model in VRAM at a time; fp32 weights ~15.5 GiB)
+  load(ckpt, dtype="bf16")          -> hot-swap the checkpoint (one model in VRAM at a time; bf16 + engines ~9 GiB of GPU, fits a 16 GB card)
   infer(frames, state, task, n_samples=1, seed=None, num_steps=None)   num_steps: flow steps (default 10)
                                     -> chunks (K, 50, 14) ABSOLUTE actions (post-processed: unnormalized, and for
                                        relative-action checkpoints converted back to absolute with the given state),
@@ -40,7 +40,18 @@ TRT_PREFIX = os.environ.get("YAM_TRT_PREFIX", "1") == "1"      # TensorRT Gemma 
 TRT_PREFIX_PRECISION = os.environ.get("YAM_TRT_PREFIX_PRECISION", "fp16")   # fp16 | bf16 (each needs its own export)
 TRT_EXPERT = os.environ.get("YAM_TRT_EXPERT", "0") == "1"      # TensorRT action expert (trt_expert.py), opt-in; needs the ONNX in trt_cache/
 TRT_EXPERT_PRECISION = os.environ.get("YAM_TRT_EXPERT_PRECISION", "fp16")   # fp16 | bf16 (each needs its own export)
+# VRAM (2026-10-15, so that a 16 GB card such as an RTX 5070 Ti fits): the model is cast to bf16 and stripped of its two
+# unused LM heads on the host before anything touches the GPU, engines are built while the GPU is still empty, and the
+# PyTorch twin of every engine that passed the parity gate (Gemma prefix layers, SigLIP) is parked in host RAM
+# (YAM_OFFLOAD_REPLACED=0 keeps them resident; they come back on demand, see fast_denoise.GraphedDenoiser.restore).
+OFFLOAD_REPLACED = os.environ.get("YAM_OFFLOAD_REPLACED", "1") == "1"
 IMG_KEYS = ("high", "left_wrist", "right_wrist")
+
+
+def gpu_mem_gib():
+    """(used, total) of the whole device in GiB, as nvidia-smi reports it: CUDA context + torch + TensorRT, every process."""
+    free, total = torch.cuda.mem_get_info()
+    return round((total - free) / 2**30, 2), round(total / 2**30, 2)
 
 
 class PolicyHost:
@@ -64,12 +75,14 @@ class PolicyHost:
         with self.lock:
             if self.policy is not None:
                 # release everything that pins GPU memory: CUDA graph + static buffers (fast_denoise), the TensorRT
-                # engine/context, then the model; otherwise the next load OOMs (23.4 GiB card, 15.5 GiB model)
+                # engine/context, then the model; otherwise the next load OOMs (a 16 GB card has no room for two)
                 fast = getattr(self, "fast", None)
                 if fast is not None:
                     fast.graph = None; fast.s_cache = None; fast.s_out = None; fast.s_x = None
                     fast.trt = None; fast.trt_lm = None; fast.trt_expert = None
+                    fast.offloaded = {}; fast.policy = None; fast.m = None
                     self.fast = None
+                del fast   # the local would keep the old model alive (fast.policy) until this call returns
                 del self.policy, self.pre, self.post
                 self.policy = None
                 import gc
@@ -77,55 +90,46 @@ class PolicyHost:
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
                 print(f"[policy_server] released, VRAM now {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
-            self.policy = PI05Policy.from_pretrained(ckpt)
+            log = lambda m: print(m, flush=True)   # noqa: E731
+            from prism_pi.policy import fast_denoise
+            # bf16 WEIGHTS (not just autocast): -27 ms per inference (189 -> 163 ms), max |Δ| 0.003 rad (2026-09-21).
+            # Built, filled and cast in host RAM with the unused LM heads dropped: the fp32 model never reaches the GPU.
+            self.policy = fast_denoise.load_policy_on_host(ckpt, bf16=(dtype == "bf16"), log=log)
             from lerobot.policies.rtc.configuration_rtc import RTCConfig
             self.policy.config.rtc_config = RTCConfig(enabled=True, execution_horizon=16)   # no leftover -> plain denoising
             self.policy.init_rtc_processor()
-            self.policy.to("cuda").eval()
-            if dtype == "bf16":   # bf16 WEIGHTS (not just autocast): -27 ms per inference (189 -> 163 ms), max |Δ| 0.003 rad (2026-09-21)
-                self.policy.to(torch.bfloat16)
+            plans = self._build_engines(log)     # export / build whatever plan is missing while the GPU is still empty
+            self.policy.to("cuda")
             self.pre, self.post = make_pre_post_processors(self.policy.config, ckpt)
             self._prep = self._prep_gpu   # lerobot's prepare_observation_for_inference converts images on the CPU: 52 ms for 3 frames
             # CUDA-graph replay of the denoising step (fast_denoise.py): 10 steps 86 -> ~17 ms, bit-identical output;
             # also sets requires_grad=False on the weights (RTC guidance no longer records a graph: -35 ms).
-            from prism_pi.policy import fast_denoise
             self.fast = fast_denoise.install(self.policy)
-            if TRT_VISION:
+            if "vision" in plans:
                 # TensorRT SigLIP (all 3 images in one engine call): image embedding 18 -> 8 ms (bf16; fp16 6 ms). Not bit-identical
                 # (max |Δ| 0.005 rad on actions, vs 0.033 rad seed-to-seed spread): parity is re-checked after warm-up.
                 try:
                     from prism_pi.policy import trt_vision
-                    self.fast.trt = trt_vision.TRTImageEncoder(self.policy.model.paligemma_with_expert, 3, TRT_PRECISION, log=lambda m: print(m, flush=True))
+                    self.fast.trt = trt_vision.TRTImageEncoder(self.policy.model.paligemma_with_expert, 3, TRT_PRECISION, log=log)
                 except Exception as e:
                     print(f"[policy_server] TensorRT vision unavailable, eager SigLIP: {e!r}", flush=True)
                     self.fast.trt = None
-            if TRT_PREFIX:
+            if "prefix" in plans:
                 # TensorRT fp16 Gemma prefix: fp16-accumulate GEMMs run at full rate on this GPU (bf16 at half rate).
-                # ONNX exported once (trt_prefix.py --export, done on the training rig); the engine is built here per GPU.
                 try:
                     from prism_pi.policy import trt_prefix
                     lm_ = self.policy.model.paligemma_with_expert.paligemma.model.language_model
-                    onnx_ = trt_prefix.onnx_path(lm_, PREFIX_LEN, TRT_PREFIX_PRECISION)
-                    if not onnx_.exists():
-                        raise FileNotFoundError(f"no exported ONNX {onnx_.name} (run python -m prism_pi.policy.trt_prefix --export --build for this checkpoint)")
-                    plan_ = trt_prefix.build_engine(onnx_, trt_prefix.plan_path(lm_, PREFIX_LEN, TRT_PREFIX_PRECISION), log=lambda m: print(m, flush=True))
-                    self.fast.trt_lm = trt_prefix.TRTPrefix(plan_, PREFIX_LEN, lm_.config.num_hidden_layers, log=lambda m: print(m, flush=True), precision=TRT_PREFIX_PRECISION)
+                    self.fast.trt_lm = trt_prefix.TRTPrefix(plans["prefix"], PREFIX_LEN, lm_.config.num_hidden_layers, log=log, precision=TRT_PREFIX_PRECISION)
                 except Exception as e:
                     print(f"[policy_server] TensorRT prefix unavailable, eager Gemma: {e!r}", flush=True)
                     self.fast.trt_lm = None
-            if TRT_EXPERT:
+            if "expert" in plans:
                 # TensorRT action expert: one engine call per denoising step instead of a CUDA-graph replay of the bf16
-                # PyTorch step (RTX 5090 laptop: 4.4 -> 2.4 ms per step in fp16). ONNX exported once per checkpoint
-                # (python -m prism_pi.policy.trt_expert --export); the engine is built here per GPU. With an fp16 prefix
-                # engine the fp16 expert reads the KV cache straight from its output buffers.
+                # PyTorch step (RTX 5090 laptop: 4.4 -> 2.4 ms per step in fp16). With an fp16 prefix engine the fp16
+                # expert reads the KV cache straight from its output buffers.
                 try:
                     from prism_pi.policy import trt_expert
-                    m_ = self.policy.model
-                    onnx_ = trt_expert.onnx_path(m_, PREFIX_LEN, TRT_EXPERT_PRECISION)
-                    if not onnx_.exists():
-                        raise FileNotFoundError(f"no exported ONNX {onnx_.name} (run python -m prism_pi.policy.trt_expert --export --build for this checkpoint)")
-                    plan_ = trt_expert.build_engine(onnx_, trt_expert.plan_path(m_, PREFIX_LEN, TRT_EXPERT_PRECISION), log=lambda m: print(m, flush=True))
-                    self.fast.trt_expert = trt_expert.TRTExpert(plan_, m_, PREFIX_LEN, TRT_EXPERT_PRECISION, log=lambda m: print(m, flush=True))
+                    self.fast.trt_expert = trt_expert.TRTExpert(plans["expert"], self.policy.model, PREFIX_LEN, TRT_EXPERT_PRECISION, log=log)
                 except Exception as e:
                     print(f"[policy_server] TensorRT expert unavailable, CUDA-graph PyTorch expert: {e!r}", flush=True)
                     self.fast.trt_expert = None
@@ -175,10 +179,73 @@ class PolicyHost:
                 print(f"[policy_server] TensorRT {stage} ON (parity max |Δ| {d:.4f} rad, mean over 3 obs)", flush=True)
             else:
                 print(f"[policy_server] TensorRT {stage} OFF: parity max |Δ| {d:.4f} rad", flush=True)
+        if OFFLOAD_REPLACED:
+            self._offload_replaced()
         self.meta["n_infer"] = 0
         self.meta["load_s"] = round(time.time() - t0, 1)
-        self.meta["vram_gib"] = round(torch.cuda.memory_allocated() / 2**30, 1)
+        self.meta["vram_gib"] = round(torch.cuda.memory_allocated() / 2**30, 1)   # torch tensors only (engines are outside the allocator)
+        self.meta["gpu_used_gib"], self.meta["gpu_total_gib"] = gpu_mem_gib()
+        print(f"[policy_server] GPU in use {self.meta['gpu_used_gib']} of {self.meta['gpu_total_gib']} GiB (torch {self.meta['vram_gib']} GiB)", flush=True)
         return dict(self.meta)
+
+    def _build_engines(self, log) -> dict:
+        """Export / build the plans of the enabled TensorRT stages that are not cached yet, BEFORE the model is moved to
+        the GPU (the builder wants up to 8 GiB of workspace plus the weights, which does not fit next to a resident
+        model on a 16 GB card). Returns {stage: plan path}; a stage that fails here is reported and left eager."""
+        plans = {}
+        pwe = self.policy.model.paligemma_with_expert
+        if TRT_VISION:
+            try:
+                from prism_pi.policy import trt_vision
+                plans["vision"] = trt_vision.build_engine(pwe, 3, TRT_PRECISION, log=log)   # exports through a temporary GPU copy of SigLIP
+            except Exception as e:
+                print(f"[policy_server] TensorRT vision unavailable, eager SigLIP: {e!r}", flush=True)
+        if TRT_PREFIX:
+            # ONNX exported once per checkpoint (python -m prism_pi.policy.trt_prefix --export --build); the engine is built here per GPU.
+            try:
+                from prism_pi.policy import trt_prefix
+                lm_ = pwe.paligemma.model.language_model
+                onnx_ = trt_prefix.onnx_path(lm_, PREFIX_LEN, TRT_PREFIX_PRECISION)
+                if not onnx_.exists():
+                    raise FileNotFoundError(f"no exported ONNX {onnx_.name} (run python -m prism_pi.policy.trt_prefix --export --build for this checkpoint)")
+                plans["prefix"] = trt_prefix.build_engine(onnx_, trt_prefix.plan_path(lm_, PREFIX_LEN, TRT_PREFIX_PRECISION), log=log)
+            except Exception as e:
+                print(f"[policy_server] TensorRT prefix unavailable, eager Gemma: {e!r}", flush=True)
+        if TRT_EXPERT:
+            # ONNX exported once per checkpoint (python -m prism_pi.policy.trt_expert --export --build); the engine is built here per GPU.
+            try:
+                from prism_pi.policy import trt_expert
+                m_ = self.policy.model
+                onnx_ = trt_expert.onnx_path(m_, PREFIX_LEN, TRT_EXPERT_PRECISION)
+                if not onnx_.exists():
+                    raise FileNotFoundError(f"no exported ONNX {onnx_.name} (run python -m prism_pi.policy.trt_expert --export --build for this checkpoint)")
+                plans["expert"] = trt_expert.build_engine(onnx_, trt_expert.plan_path(m_, PREFIX_LEN, TRT_EXPERT_PRECISION), log=log)
+            except Exception as e:
+                print(f"[policy_server] TensorRT expert unavailable, CUDA-graph PyTorch expert: {e!r}", flush=True)
+        return plans
+
+    def _offload_replaced(self):
+        """Park the PyTorch modules whose work a confirmed engine now does in host RAM: the 18 Gemma prefix layers
+        (3.9 GiB bf16) and SigLIP + projector (0.8 GiB). The token embedding stays (the prompt is embedded in PyTorch)
+        and so does the action expert (the runtime NaN guard falls back to it). fast_denoise brings a stage back to the
+        GPU by itself when it needs the eager path (engine failure, or a batched K > 1 request)."""
+        pg = self.policy.model.paligemma_with_expert.paligemma
+        off = {}
+        if self.fast.trt_lm is not None:
+            off["prefix"] = [pg.model.language_model.layers, pg.model.language_model.norm]
+        if self.fast.trt is not None:
+            off["vision"] = [pg.model.vision_tower, pg.model.multi_modal_projector]
+        if not off:
+            return
+        before = torch.cuda.memory_allocated()
+        for mods in off.values():
+            for mod in mods:
+                mod.to("cpu")
+        self.fast.offloaded = off
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"[policy_server] parked in host RAM: {', '.join(off)} ({(before - torch.cuda.memory_allocated()) / 2**30:.1f} GiB freed)", flush=True)
 
     @staticmethod
     def _prep_gpu(observation: dict, device, task: str):
@@ -259,7 +326,7 @@ def serve(host: PolicyHost):
                 op = req.get("op")
                 try:
                     if op in ("ping", "info"):
-                        rep = {"ok": True, **host.meta, "vram_gib_now": round(torch.cuda.memory_allocated() / 2**30, 1)}
+                        rep = {"ok": True, **host.meta, "vram_gib_now": round(torch.cuda.memory_allocated() / 2**30, 1), "gpu_used_gib_now": gpu_mem_gib()[0]}
                     elif op == "load":
                         print(f"[policy_server] loading {req['ckpt']} ({req.get('dtype', 'bf16')})", flush=True)
                         rep = {"ok": True, **host.load(req["ckpt"], req.get("dtype", "bf16"))}

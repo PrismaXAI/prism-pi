@@ -42,6 +42,12 @@ def _key(pwe, precision: str) -> str:
     return h.hexdigest()[:12]
 
 
+def workspace_bytes(cap: int) -> int:
+    """TensorRT builder workspace: the cap, or what the GPU has free minus 1 GiB, whichever is smaller (never under 1 GiB)."""
+    free, _ = torch.cuda.mem_get_info()
+    return int(max(1 << 30, min(cap, free - (1 << 30))))
+
+
 def build_engine(pwe, batch: int = 3, precision: str = "fp16", log=print) -> Path:
     import tensorrt as trt
     CACHE.mkdir(exist_ok=True)
@@ -51,9 +57,13 @@ def build_engine(pwe, batch: int = 3, precision: str = "fp16", log=print) -> Pat
     onnx_path = plan.with_suffix(".onnx")
     dt = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[precision]
     vt, proj = pwe.paligemma.model.vision_tower, pwe.paligemma.model.multi_modal_projector
-    orig_dt = next(vt.parameters()).dtype
-    vt.float(); proj.float()          # export from fp32 weights, in the requested dtype; restore the model afterwards
-    enc = _ImageEncoder(pwe).to(dt).eval()
+    p0 = next(vt.parameters())
+    orig_dt, orig_dev = p0.dtype, p0.device
+    # Export from fp32 weights in the requested dtype, on the GPU (the model may still be on the host: the policy server
+    # builds engines before it moves the model over). Only SigLIP and the projector are touched; the module is restored
+    # afterwards. (Casting the whole PaliGemma here, as before, would have left the Gemma weights in the export dtype.)
+    vt.to("cuda").float().to(dt); proj.to("cuda").float().to(dt)
+    enc = _ImageEncoder(pwe).eval()
     x = torch.zeros(batch, 3, 224, 224, device="cuda", dtype=dt)
     t0 = time.time()
     try:
@@ -65,7 +75,8 @@ def build_engine(pwe, batch: int = 3, precision: str = "fp16", log=print) -> Pat
                 torch.onnx.export(enc, (x,), str(onnx_path), input_names=["pixel_values"], output_names=["features"],
                                   opset_version=18, dynamo=False, do_constant_folding=True)
     finally:
-        vt.to(orig_dt); proj.to(orig_dt)
+        vt.to(device=orig_dev, dtype=orig_dt); proj.to(device=orig_dev, dtype=orig_dt)
+        torch.cuda.empty_cache()
     log(f"[trt_vision] ONNX exported in {time.time() - t0:.0f} s")
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
@@ -74,7 +85,7 @@ def build_engine(pwe, batch: int = 3, precision: str = "fp16", log=print) -> Pat
     if not parser.parse(onnx_path.read_bytes()):
         raise RuntimeError("ONNX parse failed: " + "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
     cfg = builder.create_builder_config()
-    cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 << 30)
+    cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes(2 << 30))
     t0 = time.time()
     blob = builder.build_serialized_network(net, cfg)
     if blob is None:
