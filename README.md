@@ -22,14 +22,14 @@ during tests. Obviously, you want this disabled for bimanual tasks.
 To get the best performance, you will need fast cameras. Cheap cameras often have some level of internal buffering giving them over 1 frame of latency -- if you are using UVC cameras we
 recommend getting one that supports 90+ Hz operation. Real machine vision cameras (RealSense, ZED) should have 1 frame of latency. Unfortunately the codebase does not support RealSense
 out of the box but it should be easy to add (and ZED will never be supported since there isn't a reasonable computer with 3x GMSL2 interfaces and a good GPU). We use the ELP AR0234 USB 3.0
-cameras from Amazon. Attached to 2 m USB 3.0 extenders these seem to give OK performance for demo-like runtimes, are very cheap, and can be replaced on-site in two days if something breaks.
+cameras from Amazon. Attached to 2 m USB 3.0 extenders these seem to give OK performance, at least for demo-like MTBFs, are very cheap, and can be replaced on-site in two days if something breaks.
 
 ### Internals
 
 `prism-pi` achieves low latencies without pruning or distillation by simply recovering performance left on the table by other inference codes. Stock openpi inference code uses a naive eager
 Pytorch implementation which is 2-3x slower than an optimized implementation. This repo uses a fast TensorRT engine for the Gemma prefix which yields a 2x improvement over `torch.compile` and a 4x speedup over eager. Additionally, we discovered that an eager implementation of the expert is pathologically slow, launching thousands of small individual kernels and causing the GPU to spend a lot of time doing very little -- compiling the expert yielded a drastic improvement in performance.
 
-Finally, a GeForce-specific quirk is that GeForce-branded GPUs don't really support bf16 -- it is capped to 1/2x peak performance -- to prevent you from using them for training. Swapping the dtypes to fp16 for this compute-limited task provides a nearly 2x improvement in performance over the default bf16 with no loss in accuracy.
+Finally, a GeForce-specific quirk is that GeForce-branded GPUs don't really support bf16 -- it is capped to 1/2x peak performance -- to prevent you from using them for training. Swapping the dtypes to fp16 for this compute-limited task provides a nearly 2x improvement in performance over the default bf16 with no loss in accuracy. Additionally, an experimental fp8 path for the prefix is supported: combining this with the fp16 expert yields a nearly 2x speedup over fp16/bf16 which should allow for real time latency on mobile 5090, 60 Hz on desktop 5090/PRO 6000, and acceptable performance on 5060.
 
 ### About Us
 
