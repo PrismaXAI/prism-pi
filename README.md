@@ -31,6 +31,10 @@ Pytorch implementation which is 2-3x slower than an optimized implementation. Th
 
 Finally, a GeForce-specific quirk is that GeForce-branded GPUs don't really support bf16 -- it is capped to 1/2x peak performance -- to prevent you from using them for training. Swapping the dtypes to fp16 for this compute-limited task provides a nearly 2x improvement in performance over the default bf16 with no loss in accuracy. Additionally, an experimental fp8 path for the prefix is supported: combining this with the fp16 expert yields a nearly 2x speedup over fp16/bf16 which should allow for video-rate execution on mobile 5090, 60 Hz on desktop 5090/PRO 6000, and acceptable performance on 5060.
 
+### License
+
+MIT License, with the following addendum: you may not use the Software in this repository for inference-as-a-service products that directly sell the outputs of the Software to third-parties.
+
 ### About Us
 
 `prism-pi` is brought to you by [PrismaX](http://prismax.ai). We provide end-to-end services for data collection and model rollout on YAM and other popular embodiments, with over 6000 hours a month of capacity across the most challenging dexterous tasks in the industry, operators with thousands of hours of experience, and sensor, end effector, and scenario customization to meet you and your researchers' needs.
