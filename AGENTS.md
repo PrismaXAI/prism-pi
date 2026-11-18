@@ -127,8 +127,8 @@ run as TensorRT engines; without any of them everything still works, slower.
 | stage | engine | how it gets built | switches |
 |---|---|---|---|
 | vision (SigLIP on the 3 images) | `trt_vision.py` | automatically on first load (1-3 min, cached in `trt_cache/`) | `YAM_TRT_VISION=0` to disable; `YAM_TRT_PRECISION=bf16` (default) or `fp16` |
-| prefix (Gemma, fills the KV cache) | `trt_prefix.py` | one-time export per checkpoint, below (about 1 min, 7 GB of disk) | `YAM_TRT_PREFIX=0`; `YAM_TRT_PREFIX_PRECISION=fp16` (default) or `bf16` |
-| action expert (the 10 flow-matching steps) | `trt_expert.py` | one-time export per checkpoint, below (under 1 min, 1.6 GB) | **opt-in**: `YAM_TRT_EXPERT=1`; `YAM_TRT_EXPERT_PRECISION=fp16` (default) or `bf16` |
+| prefix (Gemma, fills the KV cache) | `trt_prefix.py` | one-time export per checkpoint, below (about 1 min, 7 GB of disk) | `YAM_TRT_PREFIX=0`; `YAM_TRT_PREFIX_PRECISION=fp16` (default) or `bf16` (`mxfp8`: see the FP8 path below) |
+| action expert (the 10 flow-matching steps) | `trt_expert.py` | one-time export per checkpoint, below (under 1 min, 1.6 GB) | **opt-in**: `YAM_TRT_EXPERT=1`; `YAM_TRT_EXPERT_PRECISION=fp16` (default) or `bf16` (`mxfp8`: see the FP8 path below) |
 
 Exports (stop the server first, they need the VRAM; each precision is its own export; the tools build the model in
 host RAM and need about 7 GiB of GPU memory plus the TensorRT builder's workspace, which is capped at what is free):
@@ -162,6 +162,29 @@ In closed loop (`yamulator` through this server, 30 paired scenes per configurat
 counts were 22 of 30 without the expert engine and 23 to 26 with it (fp16, bf16, all-fp16): no difference beyond the
 run-to-run noise of that sample size. The expert engine is opt-in because it is the newest stage and has not run on
 the rig yet: turn it on after `--check` passes for your checkpoint, and judge it by rollouts (simulator, then rig).
+
+**Experimental FP8 path (RTX 50-series / Blackwell only, opt-in, not yet run on the rig).** `mx_prefix.py` and
+`mx_expert.py` are not TensorRT engines: they run the Gemma prefix (block-scaled MXFP8 GEMMs through cuBLASLt) and the
+whole 10-step denoising loop (FP8 linears and a fused attention kernel, one CUDA graph, RTC guidance included) with
+custom CUDA kernels, `mxq.cu` and `mxe.cu` next to them. There is no export step and no per-checkpoint file: the
+weights are quantized at load in under a second. Requirements: a GPU with compute capability 10.0 or higher
+(otherwise the stage reports `unavailable` and the server falls back to the eager path), and `nvcc` from a CUDA
+toolkit that knows that GPU (12.8 or newer), needed once to compile the kernels into `trt_cache/*.cubin`. `nvcc` is
+looked up in `/usr/local/cuda/bin`, then on `PATH`; `YAM_NVCC=/path/to/nvcc` overrides. It is not part of the pip
+environment: check `nvcc --version` before enabling, and do not install a toolkit without asking the user. Enable with
+
+    YAM_TRT_PRECISION=fp16 YAM_TRT_PREFIX_PRECISION=mxfp8 YAM_TRT_EXPERT=1 YAM_TRT_EXPERT_PRECISION=mxfp8 ./rig_up.sh
+
+and expect `MXPrefix prefix ON (parity ...)` and `MXExpert expert ON (parity ...)` in `policy_server.log` (the same
+load-time parity gate as the engines). The two stages are independent: either variable pair can be set alone.
+Measured on the RTX 5090 laptop, RTC on, against the default configuration in the same session: 83 -> 45 ms per
+inference (vision 9.5 -> 6.3 ms from the fp16 SigLIP engine, prefix 25 -> 18 ms, denoising loop 49 -> 15 ms), GPU
+memory 6.9 GiB. The cost is precision: against the fp32 reference on 120 logged observations the per-chunk maximum
+error is 0.008 rad median and 0.024 rad at the 90th percentile, about 3 times the default configuration's (0.003 /
+0.009), with one observation of the 120 at 0.75 rad (a different action mode; seed-to-seed spread is 0.04 median,
+0.30 at the 90th percentile). In closed loop (`yamulator`, 90 paired scenes) lifts were 69 of 90 against 68 for the
+default: no measurable difference. Constraints: batch size 1, a prefix length that is a multiple of 96 tokens (the
+default 864 is), action-expert head dimension 256; the constructors assert them. Unset the variables to go back.
 
 Stop the server with `.venv/bin/python -m prism_pi.policy.client shutdown`.
 One model at a time: while the server is up, loading the model in another process can run out of VRAM.
@@ -302,7 +325,7 @@ Rig geometry matters as much as software. What we measured, in the simulator and
 |---|---|
 | `prism_pi/webui.py` | operator UI, camera capture (one ffmpeg per camera), e-stop, session control, frame recorder |
 | `prism_pi/control/` | `executor.py` (the control loop; `offline_test.py` = the same loop on stub arms) and the command shaping it applies: `arm_arbiter.py` (one arm at a time in the shared zone), `tool_offset.py` (downward-speed cap, pre-close advance), `kinematics.py` (URDF forward kinematics / IK those two need), `sag_comp.py` |
-| `prism_pi/policy/` | `server.py` and `client.py` (`info`, `load <ckpt>`, `shutdown`), server-side acceleration (`fast_denoise.py` CUDA graph, `trt_vision.py` / `trt_prefix.py` / `trt_expert.py` TensorRT engines in `trt_cache/`), `relative_actions_compat.py` |
+| `prism_pi/policy/` | `server.py` and `client.py` (`info`, `load <ckpt>`, `shutdown`), server-side acceleration (`fast_denoise.py` CUDA graph, `trt_vision.py` / `trt_prefix.py` / `trt_expert.py` TensorRT engines in `trt_cache/`, experimental FP8 executors `mx_prefix.py` / `mx_expert.py` with their CUDA kernels `mxq.cu` / `mxe.cu`), `relative_actions_compat.py` |
 | `prism_pi/rig/` | `mapping.py` (reads `config/rig_mapping.json`), `hardware.py` (zero-torque arm reader, camera sources, CAN names, `GRIP_CAL`), `dryrun.py` (passive inference check) |
 | `prism_pi/rollout_to_lerobot.py` | rollout + frame recording -> LeRobot dataset |
 | `prism_pi/paths.py` | every file location (config, e-stop latch, state files, outputs) in one place |

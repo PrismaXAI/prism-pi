@@ -213,6 +213,33 @@ class GraphedDenoiser:
                 self.trt_expert.load(prefix_pad_masks, past_key_values)
 
         x_t = noise
+        if use_trt_expert and hasattr(self.trt_expert, "sample") and not (m.rtc_processor is not None and m.rtc_processor.is_debug_enabled()):
+            # an expert backend that runs the whole denoising loop itself (mx_expert.MXExpert: one CUDA graph, RTC prefix
+            # guidance in closed form); prev-chunk padding, horizon clamp and prefix weights as RTCProcessor.denoise_step
+            prev, w, mg = None, None, 0.0
+            left = kwargs.get("prev_chunk_left_over")
+            if m._rtc_enabled() and left is not None:
+                rp = m.rtc_processor
+                left = left if left.dim() == 3 else left.unsqueeze(0)
+                eh = kwargs.get("execution_horizon")
+                eh = rp.rtc_config.execution_horizon if eh is None else eh
+                eh = min(eh, left.shape[1])
+                S_, A_ = noise.shape[1], noise.shape[2]
+                prev = torch.zeros(S_, A_, device=device)
+                prev[: left.shape[1], : left.shape[2]] = left[0, :S_, :A_]
+                w = rp.get_prefix_weights(kwargs.get("inference_delay"), eh, S_).to(device)
+                mg = float(rp.rtc_config.max_guidance_weight)
+            try:
+                return self.trt_expert.sample(noise, num_steps, prev, w, mg)
+            except Exception as e:   # never fail an inference over an engine
+                print(f"[fast_denoise] expert loop failed, stepping the PyTorch expert from now on: {e!r}", flush=True)
+                self.trt_expert = None; use_trt_expert = False
+                if not prefix_done or not isinstance(past_key_values, DynamicCache):
+                    self.restore("prefix", "PyTorch expert needs a KV cache")
+                    m.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"
+                    _, past_key_values = m.paligemma_with_expert.forward(
+                        attention_mask=prefix_att_2d_masks_4d, position_ids=prefix_position_ids, past_key_values=None,
+                        inputs_embeds=[prefix_embs, None], use_cache=True)
         use_graph = self.ok and bsize == 1 and not use_trt_expert
         if use_graph:
             try:

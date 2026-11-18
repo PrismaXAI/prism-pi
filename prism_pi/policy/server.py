@@ -37,9 +37,12 @@ PREFIX_LEN = 3 * 256 + PROMPT_MAX_TOKENS   # prefix tokens = 3 images x 256 + pr
 TRT_VISION = os.environ.get("YAM_TRT_VISION", "1") == "1"   # TensorRT SigLIP (trt_vision.py); set 0 for eager
 TRT_PRECISION = os.environ.get("YAM_TRT_PRECISION", "bf16")   # bf16 = same dtype as the rest of the model (fp16 is ~2 ms faster)
 TRT_PREFIX = os.environ.get("YAM_TRT_PREFIX", "1") == "1"      # TensorRT Gemma prefix (trt_prefix.py); needs the ONNX in trt_cache/
-TRT_PREFIX_PRECISION = os.environ.get("YAM_TRT_PREFIX_PRECISION", "fp16")   # fp16 | bf16 (each needs its own export)
+TRT_PREFIX_PRECISION = os.environ.get("YAM_TRT_PREFIX_PRECISION", "fp16")   # fp16 | bf16 (each needs its own export) | mxfp8
+# mxfp8 = not a TensorRT engine: mx_prefix.py, a custom executor with block-scaled FP8 GEMMs (Blackwell GPUs only; no export,
+# weights quantized at load in < 1 s; needs nvcc once to compile mxq.cu). Opt-in, experimental (2026-11-16).
 TRT_EXPERT = os.environ.get("YAM_TRT_EXPERT", "0") == "1"      # TensorRT action expert (trt_expert.py), opt-in; needs the ONNX in trt_cache/
-TRT_EXPERT_PRECISION = os.environ.get("YAM_TRT_EXPERT_PRECISION", "fp16")   # fp16 | bf16 (each needs its own export)
+TRT_EXPERT_PRECISION = os.environ.get("YAM_TRT_EXPERT_PRECISION", "fp16")   # fp16 | bf16 (each needs its own export) | mxfp8
+# mxfp8 = mx_expert.py, a custom FP8 executor of the denoising step (Blackwell GPUs only; no export; needs nvcc once).
 # VRAM (2026-10-15, so that a 16 GB card such as an RTX 5070 Ti fits): the model is cast to bf16 and stripped of its two
 # unused LM heads on the host before anything touches the GPU, engines are built while the GPU is still empty, and the
 # PyTorch twin of every engine that passed the parity gate (Gemma prefix layers, SigLIP) is parked in host RAM
@@ -119,7 +122,11 @@ class PolicyHost:
                 try:
                     from prism_pi.policy import trt_prefix
                     lm_ = self.policy.model.paligemma_with_expert.paligemma.model.language_model
-                    self.fast.trt_lm = trt_prefix.TRTPrefix(plans["prefix"], PREFIX_LEN, lm_.config.num_hidden_layers, log=log, precision=TRT_PREFIX_PRECISION)
+                    if plans["prefix"] == "mxfp8":   # custom MXFP8 executor (same call interface as TRTPrefix)
+                        from prism_pi.policy import mx_prefix
+                        self.fast.trt_lm = mx_prefix.MXPrefix(lm_, PREFIX_LEN, log=log)
+                    else:
+                        self.fast.trt_lm = trt_prefix.TRTPrefix(plans["prefix"], PREFIX_LEN, lm_.config.num_hidden_layers, log=log, precision=TRT_PREFIX_PRECISION)
                 except Exception as e:
                     print(f"[policy_server] TensorRT prefix unavailable, eager Gemma: {e!r}", flush=True)
                     self.fast.trt_lm = None
@@ -128,8 +135,12 @@ class PolicyHost:
                 # PyTorch step (RTX 5090 laptop: 4.4 -> 2.4 ms per step in fp16). With an fp16 prefix engine the fp16
                 # expert reads the KV cache straight from its output buffers.
                 try:
-                    from prism_pi.policy import trt_expert
-                    self.fast.trt_expert = trt_expert.TRTExpert(plans["expert"], self.policy.model, PREFIX_LEN, TRT_EXPERT_PRECISION, log=log)
+                    if plans["expert"] == "mxfp8":   # custom FP8 executor (same load / step interface as TRTExpert)
+                        from prism_pi.policy import mx_expert
+                        self.fast.trt_expert = mx_expert.MXExpert(self.policy.model, PREFIX_LEN, log=log)
+                    else:
+                        from prism_pi.policy import trt_expert
+                        self.fast.trt_expert = trt_expert.TRTExpert(plans["expert"], self.policy.model, PREFIX_LEN, TRT_EXPERT_PRECISION, log=log)
                 except Exception as e:
                     print(f"[policy_server] TensorRT expert unavailable, CUDA-graph PyTorch expert: {e!r}", flush=True)
                     self.fast.trt_expert = None
@@ -176,7 +187,7 @@ class PolicyHost:
             d = float(np.mean([np.abs(a_ - b_)[:, A].max() for a_, b_ in zip(with_, without)]))   # NaN/Inf in either -> not < thr -> OFF
             if d < thr:
                 setattr(self.fast, attr, eng)
-                print(f"[policy_server] TensorRT {stage} ON (parity max |Δ| {d:.4f} rad, mean over 3 obs)", flush=True)
+                print(f"[policy_server] {'TensorRT' if type(eng).__name__.startswith('TRT') else type(eng).__name__} {stage} ON (parity max |Δ| {d:.4f} rad, mean over 3 obs)", flush=True)
             else:
                 print(f"[policy_server] TensorRT {stage} OFF: parity max |Δ| {d:.4f} rad", flush=True)
         if OFFLOAD_REPLACED:
@@ -205,21 +216,33 @@ class PolicyHost:
             try:
                 from prism_pi.policy import trt_prefix
                 lm_ = pwe.paligemma.model.language_model
-                onnx_ = trt_prefix.onnx_path(lm_, PREFIX_LEN, TRT_PREFIX_PRECISION)
-                if not onnx_.exists():
-                    raise FileNotFoundError(f"no exported ONNX {onnx_.name} (run python -m prism_pi.policy.trt_prefix --export --build for this checkpoint)")
-                plans["prefix"] = trt_prefix.build_engine(onnx_, trt_prefix.plan_path(lm_, PREFIX_LEN, TRT_PREFIX_PRECISION), log=log)
+                if TRT_PREFIX_PRECISION == "mxfp8":
+                    from prism_pi.policy import mx_prefix
+                    if not mx_prefix.supported():
+                        raise RuntimeError("the MXFP8 prefix executor needs a Blackwell GPU (compute capability >= 10.0)")
+                    plans["prefix"] = "mxfp8"          # nothing to build: the executor quantizes the weights once the model is on the GPU
+                else:
+                    onnx_ = trt_prefix.onnx_path(lm_, PREFIX_LEN, TRT_PREFIX_PRECISION)
+                    if not onnx_.exists():
+                        raise FileNotFoundError(f"no exported ONNX {onnx_.name} (run python -m prism_pi.policy.trt_prefix --export --build for this checkpoint)")
+                    plans["prefix"] = trt_prefix.build_engine(onnx_, trt_prefix.plan_path(lm_, PREFIX_LEN, TRT_PREFIX_PRECISION), log=log)
             except Exception as e:
                 print(f"[policy_server] TensorRT prefix unavailable, eager Gemma: {e!r}", flush=True)
         if TRT_EXPERT:
             # ONNX exported once per checkpoint (python -m prism_pi.policy.trt_expert --export --build); the engine is built here per GPU.
             try:
-                from prism_pi.policy import trt_expert
                 m_ = self.policy.model
-                onnx_ = trt_expert.onnx_path(m_, PREFIX_LEN, TRT_EXPERT_PRECISION)
-                if not onnx_.exists():
-                    raise FileNotFoundError(f"no exported ONNX {onnx_.name} (run python -m prism_pi.policy.trt_expert --export --build for this checkpoint)")
-                plans["expert"] = trt_expert.build_engine(onnx_, trt_expert.plan_path(m_, PREFIX_LEN, TRT_EXPERT_PRECISION), log=log)
+                if TRT_EXPERT_PRECISION == "mxfp8":
+                    from prism_pi.policy import mx_expert
+                    if not mx_expert.supported():
+                        raise RuntimeError("the FP8 expert executor needs a Blackwell GPU (compute capability >= 10.0)")
+                    plans["expert"] = "mxfp8"          # nothing to build: weights are quantized once the model is on the GPU
+                else:
+                    from prism_pi.policy import trt_expert
+                    onnx_ = trt_expert.onnx_path(m_, PREFIX_LEN, TRT_EXPERT_PRECISION)
+                    if not onnx_.exists():
+                        raise FileNotFoundError(f"no exported ONNX {onnx_.name} (run python -m prism_pi.policy.trt_expert --export --build for this checkpoint)")
+                    plans["expert"] = trt_expert.build_engine(onnx_, trt_expert.plan_path(m_, PREFIX_LEN, TRT_EXPERT_PRECISION), log=log)
             except Exception as e:
                 print(f"[policy_server] TensorRT expert unavailable, CUDA-graph PyTorch expert: {e!r}", flush=True)
         return plans
