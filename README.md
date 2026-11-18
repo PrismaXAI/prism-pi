@@ -33,7 +33,7 @@ Finally, a GeForce-specific quirk is that GeForce-branded GPUs don't really supp
 
 ### License
 
-MIT License, with the following addendum: you may not use the Software in this repository for inference-as-a-service products that directly sell the outputs of the Software to third-parties.
+MIT License, with the following addendum: you may not use the Software in this repository for inference-as-a-service products that directly sell the outputs of the Software to third parties.
 
 ### About Us
 
